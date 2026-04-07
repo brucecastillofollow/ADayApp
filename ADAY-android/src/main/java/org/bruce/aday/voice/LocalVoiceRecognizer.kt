@@ -1,13 +1,21 @@
 package org.bruce.aday.voice
 
+import android.Manifest
+import android.content.ContentValues
 import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.MediaScannerConnection
+import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.Log
+import androidx.core.content.ContextCompat
+import org.bruce.aday.R
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
@@ -15,8 +23,11 @@ import java.io.BufferedInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
 
 /**
@@ -42,30 +53,155 @@ class LocalVoiceRecognizer(
     @Volatile
     private var loadCancelled: Boolean = false
 
+    /** True while [finishSession] is tearing down; [start] must not run until this clears. */
+    @Volatile
+    private var sessionFinishInProgress: Boolean = false
+
+    private val sessionLock = Any()
+
+    /** Set when [ModelSetupCancelled] (user stopped or setup interrupted before capture). */
+    @Volatile
+    private var setupCancelledForSession: Boolean = false
+
+    /**
+     * When the activity goes to background during model download only (no mic yet), we skip
+     * [stop] so the download can finish; then we cache the model but do not open the mic until
+     * the user taps voice again.
+     */
+    @Volatile
+    private var deferCaptureAfterModelReady: Boolean = false
+
+    /** Optional: invoked on the main thread when the model finished in the background after [onHostStoppedDuringModelLoadOnly]. */
+    var onDeferredModelReady: (() -> Unit)? = null
+
+    private var lastDownloadProgressPostBytes: Long = 0
+
+    private fun postModelSetupUi(state: VoiceModelSetupUiState) {
+        mainHandler.post { onModelSetupUi?.invoke(state) }
+    }
+
+    fun isSessionFinishInProgress(): Boolean = sessionFinishInProgress
+
+    /** True while the mic capture thread is running. */
+    fun isCaptureActive(): Boolean {
+        val t = captureThread
+        return t != null && t.isAlive
+    }
+
+    /** True while the offline model is loading and not yet cached (first launch or after clear data). */
+    fun isModelLoadInProgress(): Boolean {
+        val t = modelLoadThread
+        return cachedModel == null && t != null && t.isAlive
+    }
+
+    /**
+     * Call from [android.app.Activity.onStop] when the user had started voice but the microphone
+     * is not active yet (model still downloading). Avoids [stop], which would cancel the download
+     * (e.g. full-screen ads pausing the activity).
+     */
+    fun onHostStoppedDuringModelLoadOnly() {
+        deferCaptureAfterModelReady = true
+        Log.i(LOG_TAG, "defer_capture_until_next_tap_after_model_ready")
+    }
+
+    /** Consume one-shot flag for UI: session ended because model setup was cancelled before any audio. */
+    fun consumeSetupCancelled(): Boolean {
+        synchronized(sessionLock) {
+            val v = setupCancelledForSession
+            setupCancelledForSession = false
+            return v
+        }
+    }
+
     fun start() {
-        loadCancelled = false
-        lastTranscript = ""
+        synchronized(sessionLock) {
+            if (sessionFinishInProgress) {
+                Log.w(LOG_TAG, "start ignored: session still stopping")
+                return
+            }
+            loadCancelled = false
+            lastTranscript = ""
+            setupCancelledForSession = false
+        }
         ensureModelAndStart()
+    }
+
+    /**
+     * Starts download / unpack / native load of the offline Vosk model in a background thread
+     * without opening the microphone. Safe to call from [android.app.Application.onCreate]; pairs
+     * with [start] when the user uses voice (reuses [cachedModel] if already loaded).
+     */
+    fun prefetchModelIfNeeded() {
+        if (cachedModel != null) {
+            Log.i(LOG_TAG, "prefetch_model: already cached")
+            return
+        }
+        synchronized(sessionLock) {
+            if (sessionFinishInProgress) {
+                Log.i(LOG_TAG, "prefetch_model: skipped (session finishing)")
+                return
+            }
+            if (modelLoadThread?.isAlive == true) {
+                Log.i(LOG_TAG, "prefetch_model: skipped (load already running)")
+                return
+            }
+            loadCancelled = false
+        }
+        startModelLoadThread(startCaptureAfterLoad = false, prefetchFromApp = true)
     }
 
     fun stop() {
         loadCancelled = true
-        joinCaptureThread(CAPTURE_JOIN_MS)
         modelLoadThread?.interrupt()
-        modelLoadThread = null
-        postListening(false)
+        Thread {
+            shutdownVoiceThreadsAfterModelJoin(MODEL_LOAD_JOIN_SHORT_MS)
+        }.start()
     }
 
+    /**
+     * Ends recording on a worker thread so the UI thread never blocks on [Thread.join] (up to ~2
+     * minutes on slow storage). Also waits for the offline model to finish loading on first use
+     * (Galaxy S9 is slow) before joining capture; otherwise [lastTranscript] stays empty.
+     * Duplicate calls are ignored (only the first stop runs teardown).
+     */
     fun finishSession(onComplete: (String) -> Unit) {
+        synchronized(sessionLock) {
+            if (sessionFinishInProgress) {
+                Log.i(LOG_TAG, "finishSession ignored: already stopping")
+                return
+            }
+            sessionFinishInProgress = true
+        }
         loadCancelled = true
+        modelLoadThread?.interrupt()
+        Thread {
+            try {
+                shutdownVoiceThreadsAfterModelJoin(MODEL_LOAD_JOIN_MS)
+            } finally {
+                val transcript = lastTranscript
+                mainHandler.postDelayed(
+                    {
+                        synchronized(sessionLock) {
+                            sessionFinishInProgress = false
+                        }
+                        onComplete(transcript)
+                    },
+                    SESSION_COMPLETE_DELAY_MS,
+                )
+            }
+        }.start()
+    }
+
+    private fun shutdownVoiceThreadsAfterModelJoin(modelJoinMs: Long) {
+        try {
+            modelLoadThread?.join(modelJoinMs)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
         joinCaptureThread(CAPTURE_JOIN_MS)
         modelLoadThread?.interrupt()
         modelLoadThread = null
         postListening(false)
-        mainHandler.postDelayed(
-            { onComplete(lastTranscript) },
-            SESSION_COMPLETE_DELAY_MS,
-        )
     }
 
     private fun joinCaptureThread(ms: Long) {
@@ -86,23 +222,81 @@ class LocalVoiceRecognizer(
             startCaptureLoop(cachedModel!!)
             return
         }
+        startModelLoadThread(startCaptureAfterLoad = true, prefetchFromApp = false)
+    }
+
+    private fun startModelLoadThread(startCaptureAfterLoad: Boolean, prefetchFromApp: Boolean) {
+        synchronized(sessionLock) {
+            if (modelLoadThread?.isAlive == true) {
+                Log.i(LOG_TAG, "model_load_already_in_progress — ignoring duplicate start")
+                return
+            }
+        }
         modelLoadThread = Thread {
             try {
                 val modelPath = ensureModelDir()
                 if (loadCancelled) return@Thread
+                postModelSetupUi(VoiceModelSetupUiState.LoadingVosk)
                 val model = Model(modelPath.absolutePath)
                 if (loadCancelled) return@Thread
                 cachedModel = model
+                if (!startCaptureAfterLoad) {
+                    postModelSetupUi(VoiceModelSetupUiState.Dismiss)
+                    Log.i(LOG_TAG, "prefetch_model_complete")
+                    return@Thread
+                }
+                if (deferCaptureAfterModelReady) {
+                    deferCaptureAfterModelReady = false
+                    postModelSetupUi(VoiceModelSetupUiState.Dismiss)
+                    Log.i(LOG_TAG, "model_ready_deferred_capture")
+                    mainHandler.post { onDeferredModelReady?.invoke() }
+                    return@Thread
+                }
                 startCaptureLoop(model)
+            } catch (_: ModelSetupCancelled) {
+                if (!prefetchFromApp) {
+                    setupCancelledForSession = true
+                }
+                postModelSetupUi(VoiceModelSetupUiState.Dismiss)
+                Log.i(LOG_TAG, "model_setup_cancelled")
             } catch (e: Exception) {
+                postModelSetupUi(VoiceModelSetupUiState.Dismiss)
                 if (!loadCancelled) {
-                    mainHandler.post { onError("Offline model setup failed: ${e.message}") }
+                    if (prefetchFromApp) {
+                        Log.w(LOG_TAG, "prefetch offline model failed", e)
+                    } else {
+                        mainHandler.post { onError("Offline model setup failed: ${e.message}") }
+                    }
                 }
             }
         }.also { it.start() }
     }
 
+    /** Samsung devices occasionally fail [VOICE_RECOGNITION]; [DEFAULT] usually works. */
+    private fun openAudioRecordOrNull(bufferSize: Int): AudioRecord? {
+        val sources = intArrayOf(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.DEFAULT,
+        )
+        for (source in sources) {
+            val rec = AudioRecord(
+                source,
+                SAMPLE_RATE_HZ,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize,
+            )
+            if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                Log.i(LOG_TAG, "audio_record_using_source=$source")
+                return rec
+            }
+            rec.release()
+        }
+        return null
+    }
+
     private fun startCaptureLoop(model: Model) {
+        postModelSetupUi(VoiceModelSetupUiState.Dismiss)
         if (loadCancelled) return
         captureThread = Thread {
             var audioRecord: AudioRecord? = null
@@ -111,6 +305,14 @@ class LocalVoiceRecognizer(
             val pcmTemp = File(context.cacheDir, "voice_session_${System.currentTimeMillis()}.pcm")
             var pcmBytes = 0
             try {
+                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    mainHandler.post {
+                        onError(context.getString(R.string.voice_permission_required))
+                    }
+                    return@Thread
+                }
                 val minBuf = AudioRecord.getMinBufferSize(
                     SAMPLE_RATE_HZ,
                     AudioFormat.CHANNEL_IN_MONO,
@@ -123,14 +325,9 @@ class LocalVoiceRecognizer(
                 val bufferSize = minBuf * 2
                 val buffer = ByteArray(bufferSize)
                 recognizer = Recognizer(model, SAMPLE_RATE)
-                audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    SAMPLE_RATE_HZ,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize,
-                )
-                if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+                audioRecord = openAudioRecordOrNull(bufferSize)
+                if (audioRecord == null || audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+                    audioRecord?.release()
                     mainHandler.post { onError("Microphone not available") }
                     return@Thread
                 }
@@ -167,18 +364,21 @@ class LocalVoiceRecognizer(
                 }
                 recognizer?.close()
                 if (pcmBytes > 0 && pcmTemp.exists()) {
+                    val pcmData = pcmTemp.readBytes()
                     val musicRoot = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
                         ?: context.filesDir
                     val wavDir = File(musicRoot, "ADay/voice")
                     if (!wavDir.exists()) wavDir.mkdirs()
-                    val wavFile = File(wavDir, "voice_${System.currentTimeMillis()}.wav")
+                    val wavName = "voice_${System.currentTimeMillis()}.wav"
+                    val wavFile = File(wavDir, wavName)
                     try {
-                        writePcmFileAsWav(pcmTemp.readBytes(), wavFile)
+                        writePcmFileAsWav(pcmData, wavFile)
                         Log.i(
                             LOG_TAG,
-                            "voice_recording_saved path=${wavFile.absolutePath} " +
+                            "voice_recording_saved app_private_path=${wavFile.absolutePath} " +
                                 "wavBytes=${wavFile.length()} pcmBytes=$pcmBytes transcript=\"$lastTranscript\"",
                         )
+                        exportWavToPublicDownloads(context, pcmData, wavName)
                     } catch (e: Exception) {
                         Log.e(LOG_TAG, "voice_recording_wav_failed", e)
                     }
@@ -188,6 +388,106 @@ class LocalVoiceRecognizer(
                 if (pcmTemp.exists()) pcmTemp.delete()
             }
         }.also { it.start() }
+    }
+
+    /**
+     * Puts a copy under **Download/ADay/voice** (internal folder name is [Environment.DIRECTORY_DOWNLOADS]
+     * = `Download`, which Samsung shows as Downloads).
+     *
+     * - **API 29+**: [MediaStore] (Downloads first; some OEMs need [MediaStore.Audio] fallback).
+     * - **API 28**: direct file write + [MediaScannerConnection] (needs [Manifest.permission.WRITE_EXTERNAL_STORAGE]).
+     */
+    private fun exportWavToPublicDownloads(appContext: Context, pcm: ByteArray, fileName: String) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            exportWavLegacyPublicDownload(appContext, pcm, fileName)
+            return
+        }
+        val resolver = appContext.contentResolver
+        val relative = "${Environment.DIRECTORY_DOWNLOADS}/ADay/voice"
+        val baseValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "audio/x-wav")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relative)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val primary = MediaStore.VOLUME_EXTERNAL_PRIMARY
+        val collections = listOf(
+            MediaStore.Downloads.getContentUri(primary),
+            MediaStore.Audio.Media.getContentUri(primary),
+        )
+        var uri: android.net.Uri? = null
+        var used: android.net.Uri? = null
+        for (collection in collections) {
+            val values = ContentValues(baseValues)
+            uri = resolver.insert(collection, values)
+            if (uri != null) {
+                used = collection
+                break
+            }
+        }
+        if (uri == null) {
+            Log.w(LOG_TAG, "voice_wav_media_insert_failed collections=Downloads+Audio")
+            return
+        }
+        try {
+            resolver.openOutputStream(uri)?.use { out ->
+                writePcmAsWavToStream(pcm, out)
+            } ?: run {
+                Log.w(LOG_TAG, "voice_wav_open_stream_failed")
+                resolver.delete(uri, null, null)
+                return
+            }
+            val done = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            resolver.update(uri, done, null, null)
+            resolver.notifyChange(uri, null)
+            Log.i(
+                LOG_TAG,
+                "voice_recording_public_downloads uri=$uri collection=$used browse=$relative file=$fileName",
+            )
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "voice_wav_media_write_failed", e)
+            try {
+                resolver.delete(uri, null, null)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun exportWavLegacyPublicDownload(appContext: Context, pcm: ByteArray, fileName: String) {
+        if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(
+                LOG_TAG,
+                "voice_wav_api28_needs_WRITE_EXTERNAL_STORAGE — grant Storage for app in system settings, " +
+                    "or upgrade device to Android 10+ for MediaStore export",
+            )
+            return
+        }
+        val dir = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            "ADay/voice",
+        )
+        if (!dir.exists() && !dir.mkdirs()) {
+            Log.e(LOG_TAG, "voice_wav_legacy_mkdir_failed ${dir.absolutePath}")
+            return
+        }
+        val file = File(dir, fileName)
+        try {
+            writePcmFileAsWav(pcm, file)
+            MediaScannerConnection.scanFile(
+                appContext,
+                arrayOf(file.absolutePath),
+                arrayOf("audio/wav"),
+            ) { path, scannedUri ->
+                Log.i(LOG_TAG, "voice_recording_public_scanned path=$path uri=$scannedUri")
+            }
+            Log.i(LOG_TAG, "voice_recording_public_downloads path=${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "voice_wav_legacy_write_failed", e)
+        }
     }
 
     private fun parseHypothesis(json: String): String? {
@@ -209,11 +509,29 @@ class LocalVoiceRecognizer(
         private const val SAMPLE_RATE_HZ = 16000
         private const val SESSION_COMPLETE_DELAY_MS = 350L
         private const val CAPTURE_JOIN_MS = 8000L
+        /** First-time model unzip/load on slow phones (e.g. Galaxy S9). */
+        private const val MODEL_LOAD_JOIN_MS = 120_000L
+        /** [stop] from [onStop] should not block long if model is still downloading. */
+        private const val MODEL_LOAD_JOIN_SHORT_MS = 3_000L
+        /** vosk-model-small-en-us-0.15.zip is ~40MB; smaller files are usually truncated downloads. */
+        private const val MIN_MODEL_ZIP_BYTES = 25_000_000L
         private var cachedModel: Model? = null
+
+        /**
+         * Download / unpack / load progress (shared by app prefetch and in-activity voice).
+         * Posted on the main thread.
+         */
+        @JvmStatic
+        var onModelSetupUi: ((VoiceModelSetupUiState) -> Unit)? = null
 
         private fun writePcmFileAsWav(pcm: ByteArray, outFile: File) {
             FileOutputStream(outFile).use { fos ->
-                val dos = DataOutputStream(fos)
+                writePcmAsWavToStream(pcm, fos)
+            }
+        }
+
+        private fun writePcmAsWavToStream(pcm: ByteArray, out: OutputStream) {
+            DataOutputStream(out).use { dos ->
                 val numChannels = 1
                 val bitsPerSample = 16
                 val byteRate = SAMPLE_RATE_HZ * numChannels * bitsPerSample / 8
@@ -251,56 +569,182 @@ class LocalVoiceRecognizer(
     }
 
     private fun ensureModelDir(): File {
+        if (loadCancelled) throw ModelSetupCancelled()
         val baseDir = File(context.filesDir, "vosk")
         if (!baseDir.exists()) baseDir.mkdirs()
         val modelDir = File(baseDir, MODEL_DIR)
-        if (modelDir.exists() && modelDir.isDirectory) return modelDir
-
         val zipFile = File(baseDir, "$MODEL_DIR.zip")
-        downloadModelZip(zipFile)
-        unzipModel(zipFile, baseDir)
-        if (!modelDir.exists()) {
-            val candidates = baseDir.listFiles()?.filter { it.isDirectory } ?: emptyList()
-            if (candidates.isNotEmpty()) return candidates.first()
-            throw IllegalStateException("Model directory not found after unzip")
+
+        if (isVoskModelLayoutValid(modelDir)) {
+            return modelDir
         }
-        return modelDir
+        if (modelDir.exists()) {
+            Log.w(LOG_TAG, "vosk_model_dir_invalid_or_incomplete path=${modelDir.absolutePath} — removing and re-fetching")
+            modelDir.deleteRecursively()
+        }
+        if (zipFile.exists() && !isPlausibleCompleteModelZip(zipFile)) {
+            Log.w(LOG_TAG, "vosk_model_zip_incomplete_or_suspicious size=${zipFile.length()} — removing")
+            zipFile.delete()
+        }
+
+        var lastError: Exception? = null
+        repeat(2) { attempt ->
+            try {
+                if (loadCancelled) throw ModelSetupCancelled()
+                downloadModelZip(zipFile)
+                if (loadCancelled) throw ModelSetupCancelled()
+                unzipModel(zipFile, baseDir)
+                if (isVoskModelLayoutValid(modelDir)) {
+                    return modelDir
+                }
+                val candidates = baseDir.listFiles()?.filter { it.isDirectory && isVoskModelLayoutValid(it) } ?: emptyList()
+                if (candidates.isNotEmpty()) return candidates.first()
+                throw IllegalStateException("Model files missing after unzip")
+            } catch (e: ModelSetupCancelled) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+                Log.w(LOG_TAG, "vosk_model_setup_attempt_${attempt + 1} failed: ${e.message}", e)
+                purgeVoskModelArtifacts(baseDir, zipFile, modelDir)
+            }
+        }
+        throw IllegalStateException(
+            "Offline model setup failed (try clearing app storage or reinstall). Cause: ${lastError?.message}",
+            lastError,
+        )
+    }
+
+    private fun purgeVoskModelArtifacts(baseDir: File, zipFile: File, modelDir: File) {
+        try {
+            zipFile.delete()
+            if (modelDir.exists()) modelDir.deleteRecursively()
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "vosk_model_purge_failed", e)
+        }
+    }
+
+    /** Vosk rejects folders that exist but lack am/conf (e.g. empty dir after failed download). */
+    private fun isVoskModelLayoutValid(dir: File): Boolean {
+        if (!dir.isDirectory) return false
+        return File(dir, "am").isDirectory && File(dir, "conf").isDirectory
+    }
+
+    /**
+     * The small English model zip is tens of MB. A 1–5 MB file is often a truncated download
+     * (bad network / process kill) and triggers "unexpected end of ZLIB input stream" on unzip.
+     */
+    private fun isPlausibleCompleteModelZip(zip: File): Boolean = zip.length() >= MIN_MODEL_ZIP_BYTES
+
+    private fun shouldPostDownloadProgress(bytesRead: Long, totalBytes: Long): Boolean {
+        if (bytesRead <= 0L) return false
+        if (totalBytes > 0L && bytesRead >= totalBytes) return true
+        val delta = bytesRead - lastDownloadProgressPostBytes
+        return delta >= 512 * 1024L
     }
 
     private fun downloadModelZip(targetZip: File) {
-        if (targetZip.exists() && targetZip.length() > 0) return
+        if (targetZip.exists() && isPlausibleCompleteModelZip(targetZip)) return
+        val partFile = File(targetZip.parentFile, "${targetZip.name}.part")
+        partFile.delete()
         val connection = URL(MODEL_URL).openConnection() as HttpURLConnection
         connection.connectTimeout = 20000
-        connection.readTimeout = 60000
+        connection.readTimeout = 120_000
         connection.requestMethod = "GET"
         connection.connect()
         if (connection.responseCode !in 200..299) {
             throw IllegalStateException("HTTP ${connection.responseCode}")
         }
-        BufferedInputStream(connection.inputStream).use { input ->
-            FileOutputStream(targetZip).use { output ->
-                input.copyTo(output)
-            }
+        var totalLen = connection.contentLengthLong
+        if (totalLen <= 0L) {
+            val c = connection.contentLength
+            totalLen = if (c > 0) c.toLong() else -1L
         }
-        connection.disconnect()
+        lastDownloadProgressPostBytes = 0L
+        postModelSetupUi(VoiceModelSetupUiState.Downloading(0L, totalLen))
+        var bytesRead = 0L
+        try {
+            BufferedInputStream(connection.inputStream).use { input ->
+                FileOutputStream(partFile).use { output ->
+                    val buf = ByteArray(64 * 1024)
+                    try {
+                        while (true) {
+                            if (loadCancelled) {
+                                connection.disconnect()
+                                postModelSetupUi(VoiceModelSetupUiState.Dismiss)
+                                throw ModelSetupCancelled()
+                            }
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            output.write(buf, 0, n)
+                            bytesRead += n
+                            if (shouldPostDownloadProgress(bytesRead, totalLen)) {
+                                lastDownloadProgressPostBytes = bytesRead
+                                postModelSetupUi(VoiceModelSetupUiState.Downloading(bytesRead, totalLen))
+                            }
+                        }
+                    } catch (e: IOException) {
+                        if (loadCancelled) {
+                            postModelSetupUi(VoiceModelSetupUiState.Dismiss)
+                            throw ModelSetupCancelled()
+                        }
+                        throw e
+                    }
+                }
+            }
+        } finally {
+            connection.disconnect()
+        }
+        val totalForUi = when {
+            totalLen > 0L -> totalLen
+            bytesRead > 0L -> -1L
+            else -> totalLen
+        }
+        postModelSetupUi(VoiceModelSetupUiState.Downloading(bytesRead, totalForUi))
+        if (!isPlausibleCompleteModelZip(partFile)) {
+            partFile.delete()
+            throw IllegalStateException("Downloaded file too small (${partFile.length()} bytes); network may have dropped.")
+        }
+        if (targetZip.exists()) targetZip.delete()
+        if (!partFile.renameTo(targetZip)) {
+            partFile.delete()
+            throw IllegalStateException("Could not finalize model zip on disk")
+        }
     }
 
     private fun unzipModel(zipFile: File, targetDir: File) {
-        ZipInputStream(BufferedInputStream(zipFile.inputStream())).use { zis ->
-            var entry = zis.nextEntry
-            while (entry != null) {
-                val outFile = File(targetDir, entry.name)
-                if (entry.isDirectory) {
-                    outFile.mkdirs()
-                } else {
-                    outFile.parentFile?.mkdirs()
-                    FileOutputStream(outFile).use { fos ->
-                        zis.copyTo(fos)
+        postModelSetupUi(VoiceModelSetupUiState.Unzipping)
+        try {
+            ZipInputStream(BufferedInputStream(zipFile.inputStream())).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (loadCancelled) throw ModelSetupCancelled()
+                    val outFile = File(targetDir, entry.name)
+                    if (entry.isDirectory) {
+                        outFile.mkdirs()
+                    } else {
+                        outFile.parentFile?.mkdirs()
+                        FileOutputStream(outFile).use { fos ->
+                            zis.copyTo(fos)
+                        }
                     }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
                 }
-                zis.closeEntry()
-                entry = zis.nextEntry
             }
+        } catch (e: ZipException) {
+            throw IOException("Corrupt or incomplete zip (unexpected end of stream). Delete and re-download.", e)
         }
     }
 }
+
+/** UI states for first-time Vosk model download, unzip, and native load. */
+sealed class VoiceModelSetupUiState {
+    /** [totalBytes] is -1 when the server did not send Content-Length. */
+    data class Downloading(val bytesRead: Long, val totalBytes: Long) : VoiceModelSetupUiState()
+    object Unzipping : VoiceModelSetupUiState()
+    object LoadingVosk : VoiceModelSetupUiState()
+    object Dismiss : VoiceModelSetupUiState()
+}
+
+/** User stopped voice or left the screen while the Vosk model was still downloading or unpacking. */
+private class ModelSetupCancelled : Exception()

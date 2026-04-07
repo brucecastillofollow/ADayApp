@@ -50,8 +50,10 @@ android {
         targetSdk = 36
         applicationId = "org.bruce.aday"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        // Include x86_64 so local Vosk + JNA work on the default Android emulator image.
-        // You may still see Play’s 16 KB page-size warning for some prebuilt .so files on emulator.
+        // One universal APK: real phones (armeabi-v7a / arm64-v8a) + x86_64 emulators (e.g. Pixel).
+        // minSdk 28 covers Galaxy S9-class devices on Android 9+. Older OS versions are not supported.
+        // Optional: add "x86" if you still use a 32-bit AVD and your vosk/jna AARs ship x86 .so files.
+        // Android 15+ may log 16 KB ELF warnings for some prebuilt native libs; see docs/VOSK_16KB.md.
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
         }

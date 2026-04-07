@@ -21,6 +21,7 @@ package org.bruce.aday
 
 import android.app.Application
 import android.content.Context
+import android.util.Log
 import com.google.android.gms.ads.MobileAds
 import org.bruce.aday.ads.RewardedAdManager
 import org.bruce.aday.core.database.UnsupportedDatabaseVersionException
@@ -32,6 +33,7 @@ import org.bruce.aday.inject.DaggerHabitsApplicationComponent
 import org.bruce.aday.inject.HabitsApplicationComponent
 import org.bruce.aday.inject.HabitsModule
 import org.bruce.aday.utils.DatabaseUtils
+import org.bruce.aday.voice.LocalVoiceRecognizer
 import org.bruce.aday.widgets.WidgetUpdater
 import java.io.File
 
@@ -44,6 +46,9 @@ class HabitsApplication : Application() {
     private lateinit var widgetUpdater: WidgetUpdater
     private lateinit var reminderScheduler: ReminderScheduler
     private lateinit var notificationTray: NotificationTray
+
+    /** Keeps the prefetch [LocalVoiceRecognizer] alive for the process lifetime. */
+    private var voiceModelPrefetch: LocalVoiceRecognizer? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -100,6 +105,15 @@ class HabitsApplication : Application() {
 
         MobileAds.initialize(this) {}
         RewardedAdManager.preload(this)
+
+        if (!isTestMode()) {
+            voiceModelPrefetch = LocalVoiceRecognizer(
+                applicationContext,
+                onError = { msg -> Log.e("ADayVoice", msg) },
+                onListening = {},
+            )
+            voiceModelPrefetch?.prefetchModelIfNeeded()
+        }
     }
 
     override fun onTerminate() {

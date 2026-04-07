@@ -26,18 +26,25 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager.PERMISSION_GRANTED
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.graphics.Color
+import android.text.format.Formatter
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat.checkSelfPermission
 import androidx.core.view.MenuItemCompat
@@ -62,9 +69,11 @@ import org.bruce.aday.inject.DaggerHabitsActivityComponent
 import org.bruce.aday.inject.HabitsActivityComponent
 import org.bruce.aday.inject.HabitsApplicationComponent
 import org.bruce.aday.utils.applyRootViewInsets
+import org.bruce.aday.utils.dismissCurrentAndShow
 import org.bruce.aday.utils.dismissCurrentDialog
 import org.bruce.aday.utils.restartWithFade
 import org.bruce.aday.voice.LocalVoiceRecognizer
+import org.bruce.aday.voice.VoiceModelSetupUiState
 import org.bruce.aday.voice.VoiceHabitCommand
 import org.bruce.aday.voice.VoiceHabitCommandParser
 
@@ -81,7 +90,6 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     lateinit var midnightTimer: MidnightTimer
 
     private var permissionAlreadyRequested = false
-    private var microphonePermissionAlreadyRequested = false
     private val permissionLauncher =
         registerForActivityResult(RequestPermission()) { isGranted: Boolean ->
             if (isGranted) {
@@ -95,12 +103,25 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             if (isGranted) {
                 launchVoiceRecognition()
             } else {
-                Toast.makeText(this, R.string.voice_permission_denied, Toast.LENGTH_SHORT).show()
+                if (ActivityCompat.shouldShowRequestPermissionRationale(this, RECORD_AUDIO)) {
+                    Toast.makeText(this, R.string.voice_permission_denied, Toast.LENGTH_LONG).show()
+                } else {
+                    AlertDialog.Builder(this)
+                        .setMessage(R.string.voice_mic_blocked_message)
+                        .setPositiveButton(R.string.voice_mic_open_settings) { _, _ ->
+                            openAppDetailsSettings()
+                        }
+                        .setNegativeButton(android.R.string.cancel, null)
+                        .show()
+                }
             }
         }
     private val mainHandler = Handler(Looper.getMainLooper())
     private var voiceOutcomeRunnable: Runnable? = null
     private var isVoiceRecording = false
+    private var voiceModelProgressDialog: AlertDialog? = null
+    private var voiceModelProgressBar: ProgressBar? = null
+    private var voiceModelProgressLabel: TextView? = null
 
     private val localVoiceRecognizer by lazy {
         LocalVoiceRecognizer(
@@ -152,6 +173,10 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         rootView.applyRootViewInsets()
         setContentView(rootView)
         localVoiceRecognizer.onTimeoutWithTranscript = { handleVoiceSessionEnd(it) }
+        localVoiceRecognizer.onDeferredModelReady = {
+            Toast.makeText(this, R.string.voice_model_ready_tap_voice, Toast.LENGTH_LONG).show()
+        }
+        LocalVoiceRecognizer.onModelSetupUi = { applyVoiceModelSetupUi(it) }
     }
 
     override fun onPrepareOptionsMenu(menu: Menu): Boolean {
@@ -179,16 +204,27 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     override fun onPause() {
         voiceOutcomeRunnable?.let { mainHandler.removeCallbacks(it) }
         voiceOutcomeRunnable = null
-        localVoiceRecognizer.stop()
-        if (isVoiceRecording) {
-            isVoiceRecording = false
-        }
-        applyVoiceMenuState()
         midnightTimer.onPause()
         screen.onDetached()
         adapter.cancelRefresh()
         dismissCurrentDialog()
         super.onPause()
+    }
+
+    override fun onStop() {
+        // Do not stop voice in onPause: full-screen ads / system UI pause the activity and would
+        // abort recording on Galaxy devices. Teardown when the activity is no longer visible.
+        if (localVoiceRecognizer.isCaptureActive()) {
+            localVoiceRecognizer.stop()
+        } else if (isVoiceRecording) {
+            // Model may still be downloading; do not call stop() or we cancel the Vosk download.
+            localVoiceRecognizer.onHostStoppedDuringModelLoadOnly()
+        }
+        if (isVoiceRecording) {
+            isVoiceRecording = false
+        }
+        applyVoiceMenuState()
+        super.onStop()
     }
 
     override fun onResume() {
@@ -258,22 +294,38 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
 
     private fun startVoiceFlow() {
         if (isVoiceRecording) {
+            isVoiceRecording = false
+            applyVoiceMenuState()
             localVoiceRecognizer.finishSession { handleVoiceSessionEnd(it) }
+            return
+        }
+        if (localVoiceRecognizer.isSessionFinishInProgress()) {
+            Toast.makeText(this, R.string.voice_wait_stopping, Toast.LENGTH_SHORT).show()
             return
         }
         if (checkSelfPermission(this, RECORD_AUDIO) == PERMISSION_GRANTED) {
             launchVoiceRecognition()
             return
         }
-        if (!microphonePermissionAlreadyRequested) {
-            voicePermissionLauncher.launch(RECORD_AUDIO)
-            microphonePermissionAlreadyRequested = true
-        } else {
-            Toast.makeText(this, R.string.voice_permission_denied, Toast.LENGTH_SHORT).show()
+        voicePermissionLauncher.launch(RECORD_AUDIO)
+    }
+
+    private fun openAppDetailsSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", packageName, null)
         }
+        startActivity(intent)
     }
 
     private fun launchVoiceRecognition() {
+        if (localVoiceRecognizer.isSessionFinishInProgress()) {
+            Toast.makeText(this, R.string.voice_wait_stopping, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (localVoiceRecognizer.isModelLoadInProgress()) {
+            Toast.makeText(this, R.string.voice_local_starting, Toast.LENGTH_SHORT).show()
+            return
+        }
         isVoiceRecording = true
         localVoiceRecognizer.start()
         rootView.post { applyVoiceMenuState() }
@@ -282,6 +334,10 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     private fun handleVoiceSessionEnd(transcript: String) {
         isVoiceRecording = false
         applyVoiceMenuState()
+        if (localVoiceRecognizer.consumeSetupCancelled()) {
+            Toast.makeText(this, R.string.voice_setup_cancelled_message, Toast.LENGTH_LONG).show()
+            return
+        }
         showTranscriptNotification(transcript)
         voiceOutcomeRunnable?.let { mainHandler.removeCallbacks(it) }
         val runnable = Runnable {
@@ -371,7 +427,12 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     }
 
     private fun deliverVoiceOutcome(transcript: String) {
-        when (val command = VoiceHabitCommandParser.parse(transcript)) {
+        val command = VoiceHabitCommandParser.parse(transcript)
+        Log.i(
+            "ADayVoice",
+            "voice_outcome raw=\"${transcript.replace("\n", " ")}\" parsed=${command?.javaClass?.simpleName}",
+        )
+        when (command) {
             is VoiceHabitCommand.AddHabit -> {
                 Toast.makeText(this, R.string.voice_understood, Toast.LENGTH_SHORT).show()
                 addHabitFromVoice(command.name, showToast = false)
@@ -445,6 +506,90 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
+    }
+
+    override fun onDestroy() {
+        LocalVoiceRecognizer.onModelSetupUi = null
+        dismissVoiceModelProgressDialog()
+        super.onDestroy()
+    }
+
+    private fun applyVoiceModelSetupUi(state: VoiceModelSetupUiState) {
+        when (state) {
+            VoiceModelSetupUiState.Dismiss -> dismissVoiceModelProgressDialog()
+            is VoiceModelSetupUiState.Downloading -> {
+                ensureVoiceModelProgressDialogShown()
+                val bar = voiceModelProgressBar ?: return
+                val label = voiceModelProgressLabel ?: return
+                val knownTotal = state.totalBytes > 0L
+                bar.isIndeterminate = !knownTotal
+                if (knownTotal) {
+                    bar.max = 10000
+                    bar.progress =
+                        ((state.bytesRead * 10000L) / state.totalBytes).toInt().coerceIn(0, 10000)
+                }
+                val readStr = Formatter.formatFileSize(this, state.bytesRead)
+                label.text = if (knownTotal) {
+                    getString(
+                        R.string.voice_model_progress_download_known,
+                        readStr,
+                        Formatter.formatFileSize(this, state.totalBytes),
+                    )
+                } else {
+                    getString(R.string.voice_model_progress_download_unknown, readStr)
+                }
+            }
+            VoiceModelSetupUiState.Unzipping -> {
+                ensureVoiceModelProgressDialogShown()
+                voiceModelProgressBar?.isIndeterminate = true
+                voiceModelProgressLabel?.setText(R.string.voice_model_progress_unzipping)
+            }
+            VoiceModelSetupUiState.LoadingVosk -> {
+                ensureVoiceModelProgressDialogShown()
+                voiceModelProgressBar?.isIndeterminate = true
+                voiceModelProgressLabel?.setText(R.string.voice_model_progress_loading_vosk)
+            }
+        }
+    }
+
+    private fun ensureVoiceModelProgressDialogShown() {
+        if (voiceModelProgressDialog?.isShowing == true) return
+        val dialog = createVoiceModelProgressDialog()
+        voiceModelProgressDialog = dialog
+        dialog.dismissCurrentAndShow()
+    }
+
+    private fun createVoiceModelProgressDialog(): AlertDialog {
+        val density = resources.displayMetrics.density
+        val pad = (24 * density).toInt()
+        val gap = (8 * density).toInt()
+        val label = TextView(this).apply {
+            setPadding(0, 0, 0, gap)
+        }
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 10000
+            isIndeterminate = false
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+            addView(label)
+            addView(bar)
+        }
+        voiceModelProgressLabel = label
+        voiceModelProgressBar = bar
+        return AlertDialog.Builder(this)
+            .setTitle(R.string.voice_model_progress_title)
+            .setView(container)
+            .setCancelable(false)
+            .create()
+    }
+
+    private fun dismissVoiceModelProgressDialog() {
+        voiceModelProgressDialog?.dismiss()
+        voiceModelProgressDialog = null
+        voiceModelProgressBar = null
+        voiceModelProgressLabel = null
     }
 
     companion object {
