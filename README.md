@@ -84,7 +84,7 @@ contribute, even if you are not a software developer.
 
 <img align="right" alt="GPL v3" src="https://www.gnu.org/graphics/gplv3-88x31.png">
 
-  Copyright (C) 2016-2025 Álinson Santos Xavier <isoron@gmail.com>
+  Copyright (C) 2016-2025 Álinson Santos Xavier <fanbackend2@gmail.com>
 
   ADAY Habit Tracker is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by the

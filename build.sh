@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (C) 2016-2025 Álinson Santos Xavier <isoron@gmail.com>
+# Copyright (C) 2016-2025 Álinson Santos Xavier <fanbackend2@gmail.com>
 # This file is part of ADAY Habit Tracker.
 #
 # ADAY Habit Tracker is free software: you can redistribute it and/or modify
