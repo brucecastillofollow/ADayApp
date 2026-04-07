@@ -50,6 +50,11 @@ android {
         targetSdk = 36
         applicationId = "org.bruce.aday"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Include x86_64 so local Vosk + JNA work on the default Android emulator image.
+        // You may still see Play’s 16 KB page-size warning for some prebuilt .so files on emulator.
+        ndk {
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+        }
     }
 
     signingConfigs {
@@ -89,6 +94,8 @@ android {
 }
 
 dependencies {
+    val localVoskAar = file("libs/vosk-android-16kb.aar")
+
     compileOnly(libs.jsr250.api)
     coreLibraryDesugaring(libs.desugar.jdk.libs)
     implementation(libs.appIntro)
@@ -108,6 +115,15 @@ dependencies {
     implementation(libs.material)
     implementation(libs.documentfile)
     implementation(libs.play.services.ads)
+    if (localVoskAar.exists()) {
+        implementation(files(localVoskAar))
+    } else {
+        implementation(libs.vosk.android)
+    }
+    // Vosk uses JNA; flat AAR does not pull transitive deps from Maven.
+    // Use the @aar artifact: the plain JAR has no com/sun/jna/android-*/libjnidispatch.so
+    // resources, which causes UnsatisfiedLinkError on device/emulator.
+    implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
     implementation(libs.opencsv)
     implementation(libs.konfetti.xml)
     implementation(project(":aday-core"))

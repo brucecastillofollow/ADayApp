@@ -1,0 +1,29 @@
+--- a/android/lib/build-vosk.sh
++++ b/android/lib/build-vosk.sh
+@@ -45,7 +45,7 @@ for arch in armeabi-v7a arm64-v8a x86_64 x86; do
+           CC=armv7a-linux-androideabi21-clang
+           CXX=armv7a-linux-androideabi21-clang++
+           ARCHFLAGS="-mfloat-abi=softfp -mfpu=neon"
+-          PAGESIZE_LDFLAGS=""
++          PAGESIZE_LDFLAGS="-Wl,-z,common-page-size=4096 -Wl,-z,max-page-size=16384"
+           ;;
+     arm64-v8a)
+           BLAS_ARCH=ARMV8
+@@ -66,7 +66,7 @@ for arch in armeabi-v7a arm64-v8a x86_64 x86; do
+           CC=x86_64-linux-android21-clang
+           CXX=x86_64-linux-android21-clang++
+           ARCHFLAGS=""
+-          PAGESIZE_LDFLAGS=""
++          PAGESIZE_LDFLAGS="-Wl,-z,common-page-size=4096 -Wl,-z,max-page-size=16384"
+           ;;
+     x86)
+           BLAS_ARCH=ATOM
+@@ -76,7 +76,7 @@ for arch in armeabi-v7a arm64-v8a x86_64 x86; do
+           CC=i686-linux-android21-clang
+           CXX=i686-linux-android21-clang++
+           ARCHFLAGS=""
+-          PAGESIZE_LDFLAGS=""
++          PAGESIZE_LDFLAGS="-Wl,-z,common-page-size=4096 -Wl,-z,max-page-size=16384"
+           ;;
+ esac
+ 

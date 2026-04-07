@@ -29,6 +29,13 @@
         android:title="@string/add_habit"
         app:showAsAction="always"/>
 
+    <item
+        android:id="@+id/actionVoiceHabit"
+        android:enabled="true"
+        android:icon="@android:drawable/ic_btn_speak_now"
+        android:title="@string/voice_habit_command"
+        app:showAsAction="always"/>
+
 
     <item
         android:id="@+id/action_filter"

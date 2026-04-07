@@ -20,27 +20,42 @@
 package org.bruce.aday.activities.habits.list
 
 import android.Manifest.permission.POST_NOTIFICATIONS
+import android.Manifest.permission.RECORD_AUDIO
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager.PERMISSION_GRANTED
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.graphics.Color
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat.checkSelfPermission
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import androidx.core.view.MenuItemCompat
 import org.bruce.aday.BaseExceptionHandler
 import org.bruce.aday.HabitsApplication
+import org.bruce.aday.R
 import org.bruce.aday.ads.RewardedAdManager
 import org.bruce.aday.activities.habits.list.views.HabitCardListAdapter
+import org.bruce.aday.core.commands.CreateHabitCommand
+import org.bruce.aday.core.models.Entry.Companion.YES_MANUAL
+import org.bruce.aday.core.models.Frequency
+import org.bruce.aday.core.models.HabitType
 import org.bruce.aday.core.models.Timestamp
 import org.bruce.aday.core.preferences.Preferences
 import org.bruce.aday.core.tasks.TaskRunner
 import org.bruce.aday.core.ui.ThemeSwitcher.Companion.THEME_DARK
 import org.bruce.aday.core.utils.MidnightTimer
+import org.bruce.aday.core.utils.DateUtils.Companion.getToday
 import org.bruce.aday.database.AutoBackup
 import org.bruce.aday.inject.ActivityContextModule
 import org.bruce.aday.inject.DaggerHabitsActivityComponent
@@ -49,6 +64,9 @@ import org.bruce.aday.inject.HabitsApplicationComponent
 import org.bruce.aday.utils.applyRootViewInsets
 import org.bruce.aday.utils.dismissCurrentDialog
 import org.bruce.aday.utils.restartWithFade
+import org.bruce.aday.voice.LocalVoiceRecognizer
+import org.bruce.aday.voice.VoiceHabitCommand
+import org.bruce.aday.voice.VoiceHabitCommandParser
 
 class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
 
@@ -61,9 +79,9 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     lateinit var screen: ListHabitsScreen
     lateinit var prefs: Preferences
     lateinit var midnightTimer: MidnightTimer
-    private val scope = CoroutineScope(Dispatchers.Main)
 
     private var permissionAlreadyRequested = false
+    private var microphonePermissionAlreadyRequested = false
     private val permissionLauncher =
         registerForActivityResult(RequestPermission()) { isGranted: Boolean ->
             if (isGranted) {
@@ -72,6 +90,35 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                 Log.i("ListHabitsActivity", "POST_NOTIFICATIONS denied")
             }
         }
+    private val voicePermissionLauncher =
+        registerForActivityResult(RequestPermission()) { isGranted: Boolean ->
+            if (isGranted) {
+                launchVoiceRecognition()
+            } else {
+                Toast.makeText(this, R.string.voice_permission_denied, Toast.LENGTH_SHORT).show()
+            }
+        }
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var voiceOutcomeRunnable: Runnable? = null
+    private var isVoiceRecording = false
+
+    private val localVoiceRecognizer by lazy {
+        LocalVoiceRecognizer(
+            context = this,
+            onError = { message ->
+                runOnUiThread {
+                    isVoiceRecording = false
+                    applyVoiceMenuState()
+                    Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+                }
+            },
+            onListening = { listening ->
+                if (listening) {
+                    showRecordingReadyNotification()
+                }
+            },
+        )
+    }
 
     private lateinit var menu: ListHabitsMenu
 
@@ -104,9 +151,39 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         component.listHabitsBehavior.onStartup()
         rootView.applyRootViewInsets()
         setContentView(rootView)
+        localVoiceRecognizer.onTimeoutWithTranscript = { handleVoiceSessionEnd(it) }
+    }
+
+    override fun onPrepareOptionsMenu(menu: Menu): Boolean {
+        applyVoiceMenuState()
+        return super.onPrepareOptionsMenu(menu)
+    }
+
+    /**
+     * Toolbar actions usually show the icon only ([showAsAction] always), so we switch icon and
+     * tint; title still updates for accessibility and overflow.
+     */
+    private fun applyVoiceMenuState() {
+        val item = rootView.tbar.menu.findItem(R.id.actionVoiceHabit) ?: return
+        if (isVoiceRecording) {
+            item.title = getString(R.string.voice_stop_recording)
+            item.setIcon(android.R.drawable.ic_media_pause)
+            MenuItemCompat.setIconTintList(item, android.content.res.ColorStateList.valueOf(Color.parseColor("#FF5252")))
+        } else {
+            item.title = getString(R.string.voice_habit_command)
+            item.setIcon(android.R.drawable.ic_btn_speak_now)
+            MenuItemCompat.setIconTintList(item, null)
+        }
     }
 
     override fun onPause() {
+        voiceOutcomeRunnable?.let { mainHandler.removeCallbacks(it) }
+        voiceOutcomeRunnable = null
+        localVoiceRecognizer.stop()
+        if (isVoiceRecording) {
+            isVoiceRecording = false
+        }
+        applyVoiceMenuState()
         midnightTimer.onPause()
         screen.onDetached()
         adapter.cancelRefresh()
@@ -166,12 +243,184 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
 
     override fun onCreateOptionsMenu(m: Menu): Boolean {
         menu.onCreate(menuInflater, m)
+        applyVoiceMenuState()
         return true
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        if (item.itemId == R.id.actionVoiceHabit) {
+            startVoiceFlow()
+            return true
+        }
         invalidateOptionsMenu()
         return menu.onItemSelected(item)
+    }
+
+    private fun startVoiceFlow() {
+        if (isVoiceRecording) {
+            localVoiceRecognizer.finishSession { handleVoiceSessionEnd(it) }
+            return
+        }
+        if (checkSelfPermission(this, RECORD_AUDIO) == PERMISSION_GRANTED) {
+            launchVoiceRecognition()
+            return
+        }
+        if (!microphonePermissionAlreadyRequested) {
+            voicePermissionLauncher.launch(RECORD_AUDIO)
+            microphonePermissionAlreadyRequested = true
+        } else {
+            Toast.makeText(this, R.string.voice_permission_denied, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun launchVoiceRecognition() {
+        isVoiceRecording = true
+        localVoiceRecognizer.start()
+        rootView.post { applyVoiceMenuState() }
+    }
+
+    private fun handleVoiceSessionEnd(transcript: String) {
+        isVoiceRecording = false
+        applyVoiceMenuState()
+        showTranscriptNotification(transcript)
+        voiceOutcomeRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            voiceOutcomeRunnable = null
+            deliverVoiceOutcome(transcript)
+        }
+        voiceOutcomeRunnable = runnable
+        mainHandler.postDelayed(runnable, VOICE_OUTCOME_DELAY_MS)
+    }
+
+    /**
+     * Shown when the offline model and [AudioRecord] are ready — user should wait for this
+     * before speaking to avoid losing the first words.
+     */
+    private fun showRecordingReadyNotification() {
+        if (isFinishing || isDestroyed) return
+        Log.i("ADayVoice", "recording_ready — mic and recognizer active; safe to speak")
+        val title = getString(R.string.voice_ready_title)
+        val message = getString(R.string.voice_ready_message)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(this, POST_NOTIFICATIONS) != PERMISSION_GRANTED
+        ) {
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            return
+        }
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(
+                VOICE_STATUS_CHANNEL_ID,
+                getString(R.string.voice_ready_title),
+                NotificationManager.IMPORTANCE_DEFAULT,
+            )
+            nm.createNotificationChannel(ch)
+        }
+        val builder = NotificationCompat.Builder(this, VOICE_STATUS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setOnlyAlertOnce(true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder.setTimeoutAfter(VOICE_READY_TIMEOUT_MS)
+        }
+        nm.notify(VOICE_READY_NOTIFICATION_ID, builder.build())
+    }
+
+    private fun showTranscriptNotification(transcript: String) {
+        val body = transcript.ifBlank { getString(R.string.voice_not_recognized) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(this, POST_NOTIFICATIONS) != PERMISSION_GRANTED
+        ) {
+            // Long transcripts are truncated in Toast; show scrollable dialog-style feedback
+            AlertDialog.Builder(this)
+                .setTitle(R.string.voice_transcript_title)
+                .setMessage(body)
+                .setPositiveButton(android.R.string.ok, null)
+                .show()
+            return
+        }
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(
+                VOICE_CHANNEL_ID,
+                getString(R.string.voice_transcript_title),
+                NotificationManager.IMPORTANCE_DEFAULT,
+            )
+            nm.createNotificationChannel(ch)
+        }
+        val title = getString(R.string.voice_transcript_title)
+        val bigTextStyle = NotificationCompat.BigTextStyle()
+            .setBigContentTitle(title)
+            .bigText(body)
+        val builder = NotificationCompat.Builder(this, VOICE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(bigTextStyle)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder.setTimeoutAfter(VOICE_NOTIFICATION_TIMEOUT_MS)
+        }
+        nm.notify(VOICE_TRANSCRIPT_NOTIFICATION_ID, builder.build())
+    }
+
+    private fun deliverVoiceOutcome(transcript: String) {
+        when (val command = VoiceHabitCommandParser.parse(transcript)) {
+            is VoiceHabitCommand.AddHabit -> {
+                Toast.makeText(this, R.string.voice_understood, Toast.LENGTH_SHORT).show()
+                addHabitFromVoice(command.name, showToast = false)
+            }
+            is VoiceHabitCommand.MarkDone -> {
+                val matched = appComponent.habitList.find {
+                    it.name.equals(command.habitName, ignoreCase = true) ||
+                        it.name.contains(command.habitName, ignoreCase = true)
+                }
+                if (matched == null) {
+                    Toast.makeText(this, getString(R.string.voice_habit_not_found, command.habitName), Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, R.string.voice_understood, Toast.LENGTH_SHORT).show()
+                    markHabitDoneFromVoice(command.habitName, showToast = false)
+                }
+            }
+            null -> Toast.makeText(this, R.string.voice_not_recognized, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun addHabitFromVoice(name: String, showToast: Boolean = true) {
+        val habit = appComponent.modelFactory.buildHabit()
+        habit.name = name
+        habit.question = "Did you $name?"
+        habit.description = ""
+        habit.frequency = Frequency(1, 1)
+        habit.type = HabitType.YES_NO
+        appComponent.commandRunner.run(CreateHabitCommand(appComponent.modelFactory, appComponent.habitList, habit))
+        adapter.refresh()
+        if (showToast) {
+            Toast.makeText(this, getString(R.string.voice_added_habit, name), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun markHabitDoneFromVoice(name: String, showToast: Boolean = true) {
+        val matchedHabit = appComponent.habitList.find {
+            it.name.equals(name, ignoreCase = true) || it.name.contains(name, ignoreCase = true)
+        }
+        if (matchedHabit == null) {
+            if (showToast) {
+                Toast.makeText(this, getString(R.string.voice_habit_not_found, name), Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        component.listHabitsBehavior.onToggle(matchedHabit, getToday(), YES_MANUAL, "", 0f, 0f)
+        adapter.refresh()
+        if (showToast) {
+            Toast.makeText(this, getString(R.string.voice_marked_done, matchedHabit.name), Toast.LENGTH_SHORT).show()
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -201,5 +450,13 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     companion object {
         const val ACTION_EDIT = "org.bruce.aday.ACTION_EDIT"
         private var hasShownRewardedAdOnMain = false
+        /** New id so channel importance can be upgraded (Android ignores updates to an existing channel id). */
+        private const val VOICE_CHANNEL_ID = "voice_transcript_v2"
+        private const val VOICE_STATUS_CHANNEL_ID = "voice_status_v1"
+        private const val VOICE_TRANSCRIPT_NOTIFICATION_ID = 90421
+        private const val VOICE_READY_NOTIFICATION_ID = 90420
+        private const val VOICE_NOTIFICATION_TIMEOUT_MS = 5000L
+        private const val VOICE_READY_TIMEOUT_MS = 6000L
+        private const val VOICE_OUTCOME_DELAY_MS = 5000L
     }
 }

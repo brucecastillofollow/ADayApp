@@ -27,5 +27,7 @@
 -keep class org.junit.** { *; }
 -keep class kotlin.** { *; }
 
+-keep class com.sun.jna.** { *; }
+-keep class org.vosk.** { *; }
 
 -dontskipnonpubliclibraryclassmembers

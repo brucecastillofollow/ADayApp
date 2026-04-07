@@ -34,6 +34,8 @@ sqliteJdbc = "3.45.1.0"
 uiautomator = "2.3.0"
 documentfile = "1.0.1"
 playServicesAds = "23.6.0"
+voskAndroid = "0.3.75"
+jna = "5.18.1"
 
 [libraries]
 annotation = { group = "androidx.annotation", name = "annotation", version.ref = "annotation" }
@@ -77,6 +79,8 @@ sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
 uiautomator = { group = "androidx.test.uiautomator", name = "uiautomator", version.ref = "uiautomator" }
 documentfile = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentfile" }
 play-services-ads = { group = "com.google.android.gms", name = "play-services-ads", version.ref = "playServicesAds" }
+vosk-android = { group = "com.alphacephei", name = "vosk-android", version.ref = "voskAndroid" }
+jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
 
 [bundles]
 androidTest = [
