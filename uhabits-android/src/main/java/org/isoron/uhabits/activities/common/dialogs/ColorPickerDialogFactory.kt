@@ -1,0 +1,47 @@
+/*
+ * Copyright (C) 2016-2025 Álinson Santos Xavier <git@axavier.org>
+ *
+ * This file is part of ADAY Habit Tracker.
+ *
+ * ADAY Habit Tracker is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version.
+ *
+ * ADAY Habit Tracker is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+package org.isoron.ADAY.activities.common.dialogs
+
+import android.content.Context
+import com.android.colorpicker.ColorPickerDialog.SIZE_SMALL
+import org.isoron.platform.gui.toInt
+import org.isoron.ADAY.R
+import org.isoron.ADAY.core.models.PaletteColor
+import org.isoron.ADAY.core.ui.views.Theme
+import org.isoron.ADAY.inject.ActivityContext
+import org.isoron.ADAY.inject.ActivityScope
+import org.isoron.ADAY.utils.StyledResources
+import javax.inject.Inject
+
+@ActivityScope
+class ColorPickerDialogFactory @Inject constructor(@param:ActivityContext private val context: Context) {
+    fun create(color: PaletteColor, theme: Theme): ColorPickerDialog {
+        val dialog = ColorPickerDialog()
+        val res = StyledResources(context)
+        val androidColor = theme.color(color).toInt()
+        dialog.initialize(
+            R.string.color_picker_default_title,
+            res.getPalette(),
+            androidColor,
+            4,
+            SIZE_SMALL
+        )
+        return dialog
+    }
+}
