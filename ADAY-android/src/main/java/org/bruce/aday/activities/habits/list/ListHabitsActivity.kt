@@ -34,6 +34,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import org.bruce.aday.BaseExceptionHandler
 import org.bruce.aday.HabitsApplication
+import org.bruce.aday.ads.RewardedAdManager
 import org.bruce.aday.activities.habits.list.views.HabitCardListAdapter
 import org.bruce.aday.core.models.Timestamp
 import org.bruce.aday.core.preferences.Preferences
@@ -150,6 +151,12 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             restartWithFade(ListHabitsActivity::class.java)
         }
         parseIntents()
+        if (!hasShownRewardedAdOnMain) {
+            hasShownRewardedAdOnMain = RewardedAdManager.show(
+                this,
+                onReward = { /* no-op: reward flow will be defined later */ }
+            )
+        }
         super.onResume()
     }
 
@@ -193,5 +200,6 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
 
     companion object {
         const val ACTION_EDIT = "org.bruce.aday.ACTION_EDIT"
+        private var hasShownRewardedAdOnMain = false
     }
 }

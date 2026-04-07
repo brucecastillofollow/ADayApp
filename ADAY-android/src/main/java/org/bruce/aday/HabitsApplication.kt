@@ -21,6 +21,8 @@ package org.bruce.aday
 
 import android.app.Application
 import android.content.Context
+import com.google.android.gms.ads.MobileAds
+import org.bruce.aday.ads.RewardedAdManager
 import org.bruce.aday.core.database.UnsupportedDatabaseVersionException
 import org.bruce.aday.core.reminders.ReminderScheduler
 import org.bruce.aday.core.ui.NotificationTray
@@ -95,6 +97,9 @@ class HabitsApplication : Application() {
             reminderScheduler.scheduleAll()
             widgetUpdater.updateWidgets()
         }
+
+        MobileAds.initialize(this) {}
+        RewardedAdManager.preload(this)
     }
 
     override fun onTerminate() {

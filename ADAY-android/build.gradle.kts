@@ -107,6 +107,7 @@ dependencies {
     implementation(libs.legacy.support.v4)
     implementation(libs.material)
     implementation(libs.documentfile)
+    implementation(libs.play.services.ads)
     implementation(libs.opencsv)
     implementation(libs.konfetti.xml)
     implementation(project(":aday-core"))
