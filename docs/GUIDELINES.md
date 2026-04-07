@@ -2,12 +2,12 @@
 
 ## Communication Channels
 
-* Our source code is [hosted on GitHub](https://github.com/iSoron/ADAY) and this is where all the main development takes place. We use [GitHub Issues](https://github.com/iSoron/ADAY/issues) for keeping track of open bugs and open development tasks.
-* Regular users are encouraged to post feature requests and support questions under [GitHub Discussions](https://github.com/iSoron/ADAY/discussions). This is also where major announcements about the project are made.
+* Our source code is [hosted on GitHub](https://github.com/bruce/uhabits) and this is where all the main development takes place. We use [GitHub Issues](https://github.com/bruce/uhabits/issues) for keeping track of open bugs and open development tasks.
+* Regular users are encouraged to post feature requests and support questions under [GitHub Discussions](https://github.com/bruce/uhabits/discussions). This is also where major announcements about the project are made.
 
 * There is also a "Technical Discussion" section on GitHub Discussions for general technical issues (e.g., project fails to build). For technical discussions related to the implementation of a particular feature, please open a draft pull request instead.
 
-* Translations are managed in a [separate translation platform](https://translate.ADAYhabits.org/).
+* Translations are managed in a [separate translation platform](https://translate.loophabits.org/).
 
 ## Building and Testing the Project
 
@@ -19,7 +19,7 @@ This repository uses the [git-flow branching model](https://nvie.com/posts/a-suc
 
 ## Submitting Code
 
-Proposed code changes should be submitted to the project through [GitHub pull requests](https://github.com/iSoron/ADAY/pulls). For the basic steps of creating a pull request, see [GitHub's documentation](https://docs.github.com/en/free-pro-team@latest/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request). The following suggestions will help your pull request get merged quickly and with few changes.
+Proposed code changes should be submitted to the project through [GitHub pull requests](https://github.com/bruce/uhabits/pulls). For the basic steps of creating a pull request, see [GitHub's documentation](https://docs.github.com/en/free-pro-team@latest/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request). The following suggestions will help your pull request get merged quickly and with few changes.
 
 * **Write a clear description of your proposed code changes:** Although it may look obvious to you, it's not always clear to others what your pull request is trying to accomplish. Please always describe what problem your pull request is trying to solve, and how it solves it (on a very high level). If you are fixing a bug that has not been reported before, please describe it first, including the steps to reproduce it.
 
@@ -52,5 +52,5 @@ The project loosely follows [semantic versioning](https://semver.org/), adapted 
 * `1.3.0` if minor new features are being introduced.
 * `2.0.0` if major new features are being introduced.
 
-Releases are first made available to beta testers on Google Play and to all F-Droid users. After no bugs are found, they are rolled out to the remaining users. Releases are also made available on [GitHub Releases](https://github.com/iSoron/ADAY/releases).
+Releases are first made available to beta testers on Google Play and to all F-Droid users. After no bugs are found, they are rolled out to the remaining users. Releases are also made available on [GitHub Releases](https://github.com/bruce/uhabits/releases).
 

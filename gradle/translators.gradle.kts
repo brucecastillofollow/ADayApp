@@ -127,7 +127,7 @@ task("updateTranslators") {
                 }
             }
             val newContent = writer.toString()
-            val path = "ADAY-android/src/main/res/layout/about_translators.xml"
+            val path = "aday-android/src/main/res/layout/about_translators.xml"
             val currentContent = file(path).readText()
             if (currentContent != newContent) {
                 file(path).writeText(newContent)

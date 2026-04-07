@@ -1,13 +1,13 @@
 #!/bin/bash
-# Copyright (C) 2016-2025 Álinson Santos Xavier <fanbackend2@gmail.com>
-# This file is part of ADAY Habit Tracker.
+# Copyright (C) 2016-2025 Álinson Santos Xavier <bruce@gmail.com>
+# This file is part of ADay.
 #
-# ADAY Habit Tracker is free software: you can redistribute it and/or modify
+# ADay is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by the
 # Free Software Foundation, either version 3 of the License, or (at your
 # option) any later version.
 #
-# ADAY Habit Tracker is distributed in the hope that it will be useful, but
+# ADay is distributed in the hope that it will be useful, but
 # WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
 # or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
 # more details.
@@ -18,18 +18,18 @@
 cd "$(dirname "$0")" || exit
 
 ADB="${ANDROID_HOME}/platform-tools/adb"
-ANDROID_OUTPUTS_DIR="ADAY-android/build/outputs"
+ANDROID_OUTPUTS_DIR="aday-android/build/outputs"
 AVDMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager"
-AVD_PREFIX="ADAYTest"
+AVD_PREFIX="adayTest"
 EMULATOR="${ANDROID_HOME}/emulator/emulator"
 GRADLE="./gradlew --stacktrace --quiet"
-PACKAGE_NAME=org.isoron.ADAY
+PACKAGE_NAME=org.bruce.aday
 SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
-VERSION=$(grep versionName ADAY-android/build.gradle.kts | sed -e 's/.*"\([^"]*\)".*/\1/g')
+VERSION=$(grep versionName aday-android/build.gradle.kts | sed -e 's/.*"\([^"]*\)".*/\1/g')
 BOOT_TIMEOUT=360
 
 if [ -z $VERSION ]; then
-    echo "Could not parse app version from: ADAY-android/build.gradle.kts"
+    echo "Could not parse app version from: aday-android/build.gradle.kts"
     exit 1
 fi
 
@@ -67,10 +67,10 @@ fail() {
 # -----------------------------------------------------------------------------
 
 core_build() {
-    log_info "Building ADAY-core..."
+    log_info "Building aday-core..."
     $GRADLE ktlintCheck || fail
     $GRADLE lintDebug || fail
-    $GRADLE :ADAY-core:build || fail
+    $GRADLE :aday-core:build || fail
 }
 
 # Android
@@ -98,7 +98,7 @@ android_setup() {
                 --device "Nexus 4" || return 1
 
         flock -u 10
-    ) 10>/tmp/ADAYTest.lock
+    ) 10>/tmp/adayTest.lock
 
     log_info "Launching emulator..."
     $EMULATOR \
@@ -175,13 +175,13 @@ android_test() {
 
     if [ -n "$RELEASE" ]; then
         log_info "Installing release APK..."
-        $ADB install -r ${ANDROID_OUTPUTS_DIR}/apk/release/ADAY-android-release.apk || return 1
+        $ADB install -r ${ANDROID_OUTPUTS_DIR}/apk/release/aday-android-release.apk || return 1
     else
         log_info "Installing debug APK..."
-        $ADB install -t -r ${ANDROID_OUTPUTS_DIR}/apk/debug/ADAY-android-debug.apk || return 1
+        $ADB install -t -r ${ANDROID_OUTPUTS_DIR}/apk/debug/aday-android-debug.apk || return 1
     fi
     log_info "Installing test APK..."
-    $ADB install -r ${ANDROID_OUTPUTS_DIR}/apk/androidTest/debug/ADAY-android-debug-androidTest.apk || return 1
+    $ADB install -r ${ANDROID_OUTPUTS_DIR}/apk/androidTest/debug/aday-android-debug-androidTest.apk || return 1
 
     for size in medium large; do
         OUT_INSTRUMENT=${ANDROID_OUTPUTS_DIR}/instrument-${API}.txt
@@ -259,7 +259,7 @@ android_test_parallel() {
 }
 
 android_build() {
-    log_info "Building ADAY-android..."
+    log_info "Building aday-android..."
 
     if [ -n "$RELEASE" ]; then
         log_info "Reading secret..."
@@ -268,30 +268,30 @@ android_build() {
     fi
 
     log_info "Removing old APKs..."
-    rm -vf ADAY-android/build/*.apk
+    rm -vf aday-android/build/*.apk
 
     if [ -n "$RELEASE" ]; then
         log_info "Building release APK..."
         $GRADLE updateTranslators
-        $GRADLE :ADAY-android:assembleRelease
+        $GRADLE :aday-android:assembleRelease
         cp -v \
-            ADAY-android/build/outputs/apk/release/ADAY-android-release.apk \
-            ADAY-android/build/ADAY-"$VERSION"-release.apk
+            aday-android/build/outputs/apk/release/aday-android-release.apk \
+            aday-android/build/aday-"$VERSION"-release.apk
     fi
 
     log_info "Building debug APK..."
-    $GRADLE :ADAY-android:assembleDebug --stacktrace || fail
+    $GRADLE :aday-android:assembleDebug --stacktrace || fail
     cp -v \
-        ADAY-android/build/outputs/apk/debug/ADAY-android-debug.apk \
-        ADAY-android/build/ADAY-"$VERSION"-debug.apk
+        aday-android/build/outputs/apk/debug/aday-android-debug.apk \
+        aday-android/build/aday-"$VERSION"-debug.apk
 
     log_info "Building instrumentation APK..."
     if [ -n "$RELEASE" ]; then
-        $GRADLE :ADAY-android:assembleAndroidTest  \
-            -Pandroid.injected.signing.store.file="$ADAY_KEY_STORE" \
-            -Pandroid.injected.signing.store.password="$ADAY_STORE_PASSWORD" \
-            -Pandroid.injected.signing.key.alias="$ADAY_KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$ADAY_KEY_PASSWORD" || fail
+        $GRADLE :aday-android:assembleAndroidTest  \
+            -Pandroid.injected.signing.store.file="$LOOP_KEY_STORE" \
+            -Pandroid.injected.signing.store.password="$LOOP_STORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$LOOP_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$LOOP_KEY_PASSWORD" || fail
     else
         $GRADLE assembleAndroidTest || fail
     fi
@@ -301,7 +301,7 @@ android_build() {
 
 android_accept_images() {
     find ${ANDROID_OUTPUTS_DIR}/test-screenshots -name '*.expected*' -delete
-    rsync -av ${ANDROID_OUTPUTS_DIR}/test-screenshots/ ADAY-android/src/androidTest/assets/
+    rsync -av ${ANDROID_OUTPUTS_DIR}/test-screenshots/ aday-android/src/androidTest/assets/
 }
 
 # General
@@ -323,7 +323,7 @@ _parse_opts() {
 
 _print_usage() {
     cat <<END
-CI/CD script for ADAY Habit Tracker.
+CI/CD script for Loop Habit Tracker.
 
 Usage:
     build.sh build [options]
@@ -345,20 +345,20 @@ END
 }
 
 clean() {
-    rm -rfv ADAY-android/.gradle
-    rm -rfv ADAY-android/android-pickers/build
-    rm -rfv ADAY-android/build
-    rm -rfv ADAY-android/ADAY-android/build
-    rm -rfv ADAY-core-legacy/.gradle
-    rm -rfv ADAY-core-legacy/build
-    rm -rfv ADAY-core/.gradle
-    rm -rfv ADAY-core/build
-    rm -rfv ADAY-server/.gradle
-    rm -rfv ADAY-server/build
-    rm -rfv ADAY-web/build
-    rm -rfv ADAY-web/node_modules
-    rm -rfv ADAY-web/node_modules/core-js/build
-    rm -rfv ADAY-web/node_modules/upath/build
+    rm -rfv aday-android/.gradle
+    rm -rfv aday-android/android-pickers/build
+    rm -rfv aday-android/build
+    rm -rfv aday-android/aday-android/build
+    rm -rfv aday-core-legacy/.gradle
+    rm -rfv aday-core-legacy/build
+    rm -rfv aday-core/.gradle
+    rm -rfv aday-core/build
+    rm -rfv aday-server/.gradle
+    rm -rfv aday-server/build
+    rm -rfv aday-web/build
+    rm -rfv aday-web/node_modules
+    rm -rfv aday-web/node_modules/core-js/build
+    rm -rfv aday-web/node_modules/upath/build
     rm -rfv .gradle
 }
 

@@ -4,21 +4,21 @@
 
 ### Changed
 
-- Add notes to exported CSV files (@iSoron)
+- Add notes to exported CSV files (@bruce)
 
 ### Fixed
 
-- Prevent some views from being obscured by system UI (@iSoron, #2171)
-- Disable confetti if animations are disabled globally (@iSoron, #2170)
+- Prevent some views from being obscured by system UI (@bruce, #2171)
+- Disable confetti if animations are disabled globally (@bruce, #2170)
 - Make symbols easier to distinguish in "pure black" dark mode (powerjungle, #2136)
-- Trim unit labels when necessary (@hiqua, @iSoron, #2158)
+- Trim unit labels when necessary (@hiqua, @bruce, #2158)
 
 ## [2.3.0] -- 2025-06-23
 
 ### Added
 
-- Add support for Android 15 and 16 (@iSoron)
-- Show confetti animation (@gokulk16, @iSoron, #1743)
+- Add support for Android 15 and 16 (@bruce)
+- Show confetti animation (@gokulk16, @bruce, #1743)
 - Show streaks for measurable habits (@teckwarz, #2059)
 - Allow user to unset measurable habits (@leontodd, @kalina559, #1899, #2109)
 
@@ -30,54 +30,54 @@
 
 - Fix notification when goal type is set to maximum (@manish99verma, #1931)
 - Never mark "at most" habits as completed for the day (@kalina559, #2077)
-- Increase minimum widget size (@iSoron, #2118)
+- Increase minimum widget size (@bruce, #2118)
 - Improve Gradle configuration (@jimlyas, #2108)
 
 ## [2.2.0] -- 2024-01-30
 
 ### Added
 
-- Add support for Android 14 (@iSoron, @hiqua)
+- Add support for Android 14 (@bruce, @hiqua)
 - Allow user to change app language (@leondzn)
 
 ### Fixed
 
-- Implement workaround to make notifications non-dismissible in Android 14 (@iSoron, #1872)
+- Implement workaround to make notifications non-dismissible in Android 14 (@bruce, #1872)
 - Fix splash screen background color in dark mode (@SIKV, #1888)
 
 ## [2.1.3] -- 2023-08-28
 
 ### Fixed
 
-- Use text input on Samsung devices (@iSoron, #1719)
-- Prevent crash if alarm permission is revoked (@iSoron)
-- Adjust widget colors (@iSoron)
-- Fix bug preventing screens from updating at midnight (@iSoron)
-- Fix skip button in locales that use comma instead of dot (@iSoron, #1721)
+- Use text input on Samsung devices (@bruce, #1719)
+- Prevent crash if alarm permission is revoked (@bruce)
+- Adjust widget colors (@bruce)
+- Fix bug preventing screens from updating at midnight (@bruce)
+- Fix skip button in locales that use comma instead of dot (@bruce, #1721)
 
 ## [2.1.2] -- 2023-05-26
 
 ### Fixed
 
-- Fix bug that caused widget to enter checkmark on wrong date (@iSoron, #1541)
-- Fix widget corners on Android 12 (@iSoron)
-- Fix bug that caused notes to be lost when editing a checkmark (@iSoron, #1566)
-- Prevent soft keyboard from covering entry popup (@iSoron)
-- Accept comma (instead of dot) in certain locales (@iSoron)
+- Fix bug that caused widget to enter checkmark on wrong date (@bruce, #1541)
+- Fix widget corners on Android 12 (@bruce)
+- Fix bug that caused notes to be lost when editing a checkmark (@bruce, #1566)
+- Prevent soft keyboard from covering entry popup (@bruce)
+- Accept comma (instead of dot) in certain locales (@bruce)
 
 ### Changed
 
-- Remove update delay after entering a checkmark (@iSoron)
+- Remove update delay after entering a checkmark (@bruce)
 
 ### Removed
 
-- Remove stack widgets (@iSoron)
+- Remove stack widgets (@bruce)
 
 ## [2.1.1] -- 2022-09-24
 
 ### Fixed
 
-- Fix Tasker plugin (@iSoron, #1503)
+- Fix Tasker plugin (@bruce, #1503)
 
 ## [2.1.0] -- 2022-09-10
 
@@ -87,23 +87,23 @@
 - Allow user to track "at most" numerical habits (@KristianTashkov, #1101)
 - Allow user to add skips to measurable habits (@kalina559, #1319)
 - Bring back custom frequencies (x times in y days) (@hiqua, #1079)
-- Improve number picker (@hiqua, @iSoron, #1082, #1370)
-- Add new checkmark and number picker (@iSoron, #1370)
+- Improve number picker (@hiqua, @bruce, #1082, #1370)
+- Add new checkmark and number picker (@bruce, #1370)
 - Allow user to import numerical habits from HabitBull (@hiqua, #1278)
 - Add support for Android 13 themed icons (@cheeeeer, #1497)
 
 ### Removed
 
 - Hide snooze button Android 12 notifications (@hiqua, #1226)
-- Remove preference to set LED lights (@iSoron)
+- Remove preference to set LED lights (@bruce)
 
 ### Changed
 
 - Hide failed habits along with completed ones (@hiqua, #1052)
-- Cycle through all checkmark states when toggling (@iSoron)
+- Cycle through all checkmark states when toggling (@bruce)
 - Add delay after toggling a habit (@hiqua, @kalina559, #1147)
 - Small theme improvements (@KristianTashkov, #1113)
-- Left-align habit notes (@iSoron)
+- Left-align habit notes (@bruce)
 - Increase target SDK to 31 (@hiqua)
 
 ### Fixed
@@ -113,12 +113,12 @@
 - Fix small issues in calendar chart (@kalina559, #1314)
 - Resort habit list after edit (@hiqua, #1350)
 - Fix marker scaling in frequency display (@eduebernal, #1425)
-- Fix widgets not working correctly on API 33 (@iSoron, #1488)
+- Fix widgets not working correctly on API 33 (@bruce, #1488)
 
 ### Refactoring & Testing
 
 - Replace raster icons by vector assets (@kalina559)
-- Remove JVM dependencies from ADAY-core module (@sgallese)
+- Remove JVM dependencies from aday-core module (@sgallese)
 - Add various missing tests (@sgallese)
 - Upgrade project dependencies (@hiqua, @sgallese)
 
@@ -126,12 +126,12 @@
 
 ### Fixed
 
-- Improve automatic checkmarks for monthly habits (@iSoron, #947)
-- Fix small theme issues (@iSoron)
-- Fix ANR on some Samsung phones (@iSoron, #962)
-- Fix dates before the year 2000 (@iSoron, #967)
+- Improve automatic checkmarks for monthly habits (@bruce, #947)
+- Fix small theme issues (@bruce)
+- Fix ANR on some Samsung phones (@bruce, #962)
+- Fix dates before the year 2000 (@bruce, #967)
 - Fix notification adding checkmarks to the wrong day (@hiqua, #969)
-- Fix crashes in widgets (@hiqua, @iSoron, #907, #966, #965)
+- Fix crashes in widgets (@hiqua, @bruce, #907, #966, #965)
 - Fix crash when moving habits (@hiqua, #968)
 
 ## [2.0.2] - 2021-05-23
@@ -142,57 +142,57 @@
 
 ### Fixed
 
-- Fix crash caused by numerical habits with zero target (@iSoron, #903)
-- Fix small issues with font size (@iSoron)
+- Fix crash caused by numerical habits with zero target (@bruce, #903)
+- Fix small issues with font size (@bruce)
 - Allow fractional target values (@sumanabhi, #911)
-- Fix IllegalStateException in androidx.customview.view (@iSoron, #906)
-- Fix crash when selecting habit frequency in some languages (@iSoron, #926)
-- Fix IllegalArgumentException in RingView (@iSoron, #904)
+- Fix IllegalStateException in androidx.customview.view (@bruce, #906)
+- Fix crash when selecting habit frequency in some languages (@bruce, #926)
+- Fix IllegalArgumentException in RingView (@bruce, #904)
 
 ## [2.0.1] - 2021-05-09
 
 ### Added
 
 - Make midnight delay optional and disabled by default (@hiqua)
-- Add arrows to sort menu (@iSoron)
+- Add arrows to sort menu (@bruce)
 
 ### Removed
 
 - Temporarily remove experimental device sync functionality. This feature will be re-added in
-  ADAY 2.1.
+  Loop 2.1.
 
 ### Changed
 
-- Make implicit checkmarks easier to read (@iSoron)
-- Update and improve list of translators (@hiqua, @iSoron)
+- Make implicit checkmarks easier to read (@bruce)
+- Update and improve list of translators (@hiqua, @bruce)
 
 ### Fixed
 
 - Disable transparency for stacked widgets (@hiqua)
-- Fix various color issues on the dark theme (@hiqua, @iSoron)
+- Fix various color issues on the dark theme (@hiqua, @bruce)
 - Fix "customize notifications" on older devices (@hiqua)
 - Fix snooze button in notifications when device is locked (@hiqua)
 - Fix a crash when deleting habits (@engineering4good)
-- Fix checkmark widget not rendering properly on some Samsung phones (@iSoron)
+- Fix checkmark widget not rendering properly on some Samsung phones (@bruce)
 
 ### Refactoring & Testing
 
-- Finish conversion of the entire project to Kotlin (@hiqua, @iSoron, @MarKco)
-- Automatically run large tests on GitHub Actions (@iSoron)
+- Finish conversion of the entire project to Kotlin (@hiqua, @bruce, @MarKco)
+- Automatically run large tests on GitHub Actions (@bruce)
 - Remove unused v21 resources (@hiqua)
 
 ## [2.0.0-alpha] - 2020-11-29
 
 ### Added
 
-- Track numeric habits (@iSoron, @namnl)
+- Track numeric habits (@bruce, @namnl)
 - Skip days without breaking streak (@KristianTashkov)
 - Sort habits by status (@hiqua)
-- Sort habits in reverse order (@iSoron)
+- Sort habits in reverse order (@bruce)
 - Add notes to habits (@recheej)
 - Improve readibility of charts (@chennemann)
 - Delay new day until 3am (@KristianTashkov)
-- Export backups daily (@iSoron)
+- Export backups daily (@bruce)
 
 ### Removed
 
@@ -202,7 +202,7 @@
 
 - Reset chart offset when switching scale (@alxmjo)
 - Don't show reminders from archived habits (@KristianTashkov)
-- Lapses on non-daily habits decrease the score too much (@iSoron)
+- Lapses on non-daily habits decrease the score too much (@bruce)
 - Update widgets at midnight (@KristianTashkov)
 
 ### Refactoring

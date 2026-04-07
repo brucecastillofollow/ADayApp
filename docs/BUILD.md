@@ -23,18 +23,18 @@ After installation, launch Android Studio. If this is the first time you launch 
 
 To create a complete copy of the source code repository, open the terminal (Linux/macOS) or Git Bash (Windows), navigate to the desired folder, then run:
 ```bash
-git clone https://github.com/iSoron/ADAY.git
+git clone https://github.com/bruce/uhabits.git
 ```
-The repository will be downloaded to the directory `ADAY`.
+The repository will be downloaded to the directory `uhabits`.
 
 ### Step 4: Open and run the project on Android Studio
 
 1. Launch Android Studio and select "Open an existing Android Studio project".
-2. When the IDE asks you for the project location, select `ADAY` and click "Ok".
+2. When the IDE asks you for the project location, select `uhabits` and click "Ok".
 3. Android Studio will spend some time indexing the project. When this is complete, click the toolbar icon "Sync Project with Gradle File", located near the right corner of the top toolbar.
 4. The operation will likely fail several times due to missing Android SDK components. Each time it fails, click the link "Install missing platforms", "Install build tools", etc, and try again.
 5. To test the application, create a virtual Android device using the menu "Tools" and "AVD Manager". The default options should work fine, but feel free to customize the device.
-6. Click the menu "Run" and "ADAY-android". The application should launch.
+6. Click the menu "Run" and "aday-android". The application should launch.
 
 
 ## Build from the command line
@@ -75,15 +75,15 @@ yes | sdkmanager --licenses
 
 To create a complete copy of the source code repository, navigate to your home directory and run:
 ```bash
-git clone https://github.com/iSoron/ADAY.git
+git clone https://github.com/bruce/uhabits.git
 ```
-The repository will be downloaded to the directory `ADAY`.
+The repository will be downloaded to the directory `uhabits`.
 
 ### Step 4: Compile the source code
 
-1. Navigate to the directory `ADAY`
+1. Navigate to the directory `uhabits`
 2. Run `./gradlew assembleDebug --stacktrace`
 
-If the compilation is successful, a debug APK will be generated somewhere inside the folder `ADAY-android/build/`. Currently, the full path is `./ADAY-android/build/outputs/apk/debug/ADAY-android-debug.apk`, but it may change in the future.
+If the compilation is successful, a debug APK will be generated somewhere inside the folder `aday-android/build/`. Currently, the full path is `./aday-android/build/outputs/apk/debug/aday-android-debug.apk`, but it may change in the future.
 
 The APK can be installed using the tool `adb`, which should have been automatically installed at `/opt/android-sdk/platform-tools/adb` during compilation of the project.

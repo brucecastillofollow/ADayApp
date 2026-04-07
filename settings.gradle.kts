@@ -11,7 +11,7 @@ pluginManagement {
     }
 }
 
-include(":ADAY-android", ":ADAY-core")
+include(":aday-android", ":aday-core")
 dependencyResolutionManagement {
     @Suppress("UnstableApiUsage")
     repositories {
@@ -28,5 +28,3 @@ dependencyResolutionManagement {
         maven(url = "https://jitpack.io")
     }
 }
-
-include(":ADAY-android", ":ADAY-core")
