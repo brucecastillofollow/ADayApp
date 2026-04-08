@@ -91,6 +91,18 @@
     </PreferenceCategory>
 
     <PreferenceCategory
+            android:key="voiceCategory"
+            android:title="@string/voice_llm_settings_category">
+
+        <Preference
+                android:key="downloadVoiceLlm"
+                android:summary="@string/voice_llm_settings_summary"
+                android:title="@string/voice_llm_download_menu"
+                app:iconSpaceReserved="false" />
+
+    </PreferenceCategory>
+
+    <PreferenceCategory
             android:key="reminderCategory"
             android:title="@string/reminder">
 

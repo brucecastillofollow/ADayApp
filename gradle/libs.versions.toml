@@ -36,6 +36,8 @@ documentfile = "1.0.1"
 playServicesAds = "23.6.0"
 voskAndroid = "0.3.75"
 jna = "5.18.1"
+json = "20240303"
+llamaKotlinAndroid = "0.1.0"
 
 [libraries]
 annotation = { group = "androidx.annotation", name = "annotation", version.ref = "annotation" }
@@ -81,6 +83,8 @@ documentfile = { group = "androidx.documentfile", name = "documentfile", version
 play-services-ads = { group = "com.google.android.gms", name = "play-services-ads", version.ref = "playServicesAds" }
 vosk-android = { group = "com.alphacephei", name = "vosk-android", version.ref = "voskAndroid" }
 jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
+json = { group = "org.json", name = "json", version.ref = "json" }
+llama-kotlin-android = { group = "org.codeshipping", name = "llama-kotlin-android", version.ref = "llamaKotlinAndroid" }
 
 [bundles]
 androidTest = [
@@ -99,6 +103,7 @@ androidTest = [
 test = [
     "dagger",
     "junit-junit",
+    "json",
     "mockito-kotlin",
 ]
 

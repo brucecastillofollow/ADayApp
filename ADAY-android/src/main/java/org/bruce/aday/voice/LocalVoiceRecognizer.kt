@@ -27,6 +27,7 @@ import java.io.IOException
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
 
@@ -42,6 +43,8 @@ class LocalVoiceRecognizer(
 
     /** Invoked on the main thread when the session ends with silence (Vosk endpoint) or max duration. */
     var onTimeoutWithTranscript: ((String) -> Unit)? = null
+    /** Invoked on the main thread with live partial speech text while recording. */
+    var onPartialTranscript: ((String) -> Unit)? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var modelLoadThread: Thread? = null
@@ -217,9 +220,24 @@ class LocalVoiceRecognizer(
         mainHandler.post { onListening(listening) }
     }
 
+    /**
+     * Called once after the offline speech model is fully ready: Vosk progress UI has been
+     * dismissed and capture may start (or prefetch completed). Posted on the main thread.
+     * See [onSpeechModelReady] and [org.bruce.aday.voice.llm.PendingTinyLlamaAutoShow].
+     */
+    private fun notifySpeechModelReady() {
+        if (!speechModelReadyNotified.compareAndSet(false, true)) {
+            return
+        }
+        mainHandler.post {
+            org.bruce.aday.voice.llm.PendingTinyLlamaAutoShow.markPending()
+            onSpeechModelReady?.invoke()
+        }
+    }
+
     private fun ensureModelAndStart() {
         if (cachedModel != null) {
-            startCaptureLoop(cachedModel!!)
+            startCaptureLoop(cachedModel!!, notifySpeechReady = false)
             return
         }
         startModelLoadThread(startCaptureAfterLoad = true, prefetchFromApp = false)
@@ -243,16 +261,18 @@ class LocalVoiceRecognizer(
                 if (!startCaptureAfterLoad) {
                     postModelSetupUi(VoiceModelSetupUiState.Dismiss)
                     Log.i(LOG_TAG, "prefetch_model_complete")
+                    notifySpeechModelReady()
                     return@Thread
                 }
                 if (deferCaptureAfterModelReady) {
                     deferCaptureAfterModelReady = false
                     postModelSetupUi(VoiceModelSetupUiState.Dismiss)
                     Log.i(LOG_TAG, "model_ready_deferred_capture")
+                    notifySpeechModelReady()
                     mainHandler.post { onDeferredModelReady?.invoke() }
                     return@Thread
                 }
-                startCaptureLoop(model)
+                startCaptureLoop(model, notifySpeechReady = true)
             } catch (_: ModelSetupCancelled) {
                 if (!prefetchFromApp) {
                     setupCancelledForSession = true
@@ -272,11 +292,16 @@ class LocalVoiceRecognizer(
         }.also { it.start() }
     }
 
-    /** Samsung devices occasionally fail [VOICE_RECOGNITION]; [DEFAULT] usually works. */
+    /**
+     * Prefer [DEFAULT] then [MIC] before [VOICE_RECOGNITION]: some devices and emulators route
+     * [VOICE_RECOGNITION] to an empty or over-suppressed stream (WAV duration OK but silence).
+     * Samsung cases that need DEFAULT are covered by trying it first.
+     */
     private fun openAudioRecordOrNull(bufferSize: Int): AudioRecord? {
         val sources = intArrayOf(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
             MediaRecorder.AudioSource.DEFAULT,
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
         )
         for (source in sources) {
             val rec = AudioRecord(
@@ -295,8 +320,15 @@ class LocalVoiceRecognizer(
         return null
     }
 
-    private fun startCaptureLoop(model: Model) {
+    /**
+     * @param notifySpeechReady only true the first time we open the mic after a fresh Vosk load
+     * (not when reusing [cachedModel] for a later session).
+     */
+    private fun startCaptureLoop(model: Model, notifySpeechReady: Boolean) {
         postModelSetupUi(VoiceModelSetupUiState.Dismiss)
+        if (notifySpeechReady) {
+            notifySpeechModelReady()
+        }
         if (loadCancelled) return
         captureThread = Thread {
             var audioRecord: AudioRecord? = null
@@ -304,6 +336,7 @@ class LocalVoiceRecognizer(
             var pcmOut: FileOutputStream? = null
             val pcmTemp = File(context.cacheDir, "voice_session_${System.currentTimeMillis()}.pcm")
             var pcmBytes = 0
+            var lastPartialPosted = ""
             try {
                 if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
                     PackageManager.PERMISSION_GRANTED
@@ -322,10 +355,13 @@ class LocalVoiceRecognizer(
                     mainHandler.post { onError("Microphone buffer size invalid") }
                     return@Thread
                 }
-                val bufferSize = minBuf * 2
-                val buffer = ByteArray(bufferSize)
+                // PCM 16-bit mono: frame size is 2 bytes; buffer must be a multiple of that for reads.
+                var bufferSizeBytes = minBuf * 2
+                if (bufferSizeBytes % 2 != 0) bufferSizeBytes++
+                val shortBuf = ShortArray(bufferSizeBytes / 2)
+                val byteBuf = ByteArray(bufferSizeBytes)
                 recognizer = Recognizer(model, SAMPLE_RATE)
-                audioRecord = openAudioRecordOrNull(bufferSize)
+                audioRecord = openAudioRecordOrNull(bufferSizeBytes)
                 if (audioRecord == null || audioRecord.state != AudioRecord.STATE_INITIALIZED) {
                     audioRecord?.release()
                     mainHandler.post { onError("Microphone not available") }
@@ -333,20 +369,50 @@ class LocalVoiceRecognizer(
                 }
                 pcmOut = FileOutputStream(pcmTemp)
                 audioRecord.startRecording()
+                // Avoid reading before the HAL is actually capturing (first buffers can be silent).
+                var waitMs = 0
+                while (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING && waitMs < 500) {
+                    Thread.sleep(5)
+                    waitMs += 5
+                }
                 postListening(true)
                 while (!loadCancelled) {
-                    val n = audioRecord.read(buffer, 0, buffer.size)
-                    if (n < 0) break
-                    if (n == 0) continue
-                    pcmOut.write(buffer, 0, n)
-                    pcmBytes += n
-                    val accepted = recognizer.acceptWaveForm(buffer, n)
-                    parseHypothesis(recognizer.partialResult)?.let { text -> lastTranscript = text }
+                    val nShorts = audioRecord.read(shortBuf, 0, shortBuf.size)
+                    if (nShorts < 0) break
+                    if (nShorts == 0) continue
+                    val nBytes = nShorts * 2
+                    var o = 0
+                    for (i in 0 until nShorts) {
+                        val s = shortBuf[i].toInt()
+                        byteBuf[o++] = (s and 0xff).toByte()
+                        byteBuf[o++] = ((s shr 8) and 0xff).toByte()
+                    }
+                    pcmOut.write(byteBuf, 0, nBytes)
+                    pcmBytes += nBytes
+                    val accepted = recognizer.acceptWaveForm(byteBuf, nBytes)
+                    parseHypothesis(recognizer.partialResult)?.let { text ->
+                        lastTranscript = text
+                        if (text != lastPartialPosted) {
+                            lastPartialPosted = text
+                            mainHandler.post { onPartialTranscript?.invoke(text) }
+                        }
+                    }
                     if (accepted) {
-                        parseHypothesis(recognizer.result)?.let { text -> lastTranscript = text }
+                        parseHypothesis(recognizer.result)?.let { text ->
+                            lastTranscript = text
+                            if (text != lastPartialPosted) {
+                                lastPartialPosted = text
+                                mainHandler.post { onPartialTranscript?.invoke(text) }
+                            }
+                        }
                     }
                 }
-                parseHypothesis(recognizer.finalResult)?.let { text -> lastTranscript = text }
+                parseHypothesis(recognizer.finalResult)?.let { text ->
+                    lastTranscript = text
+                    if (text != lastPartialPosted) {
+                        mainHandler.post { onPartialTranscript?.invoke(text) }
+                    }
+                }
             } catch (e: Exception) {
                 if (!loadCancelled) {
                     Log.e(LOG_TAG, "voice_capture: error", e)
@@ -359,6 +425,7 @@ class LocalVoiceRecognizer(
                 }
                 audioRecord?.release()
                 try {
+                    pcmOut?.flush()
                     pcmOut?.close()
                 } catch (_: Exception) {
                 }
@@ -517,12 +584,22 @@ class LocalVoiceRecognizer(
         private const val MIN_MODEL_ZIP_BYTES = 25_000_000L
         private var cachedModel: Model? = null
 
+        private val speechModelReadyNotified = AtomicBoolean(false)
+
         /**
          * Download / unpack / load progress (shared by app prefetch and in-activity voice).
          * Posted on the main thread.
          */
         @JvmStatic
         var onModelSetupUi: ((VoiceModelSetupUiState) -> Unit)? = null
+
+        /**
+         * Invoked once on the main thread after the offline speech model is ready (same moment as
+         * [PendingTinyLlamaAutoShow.markPending]). Optional; [ListHabitsActivity] uses this for the
+         * offline AI download dialog.
+         */
+        @JvmStatic
+        var onSpeechModelReady: (() -> Unit)? = null
 
         private fun writePcmFileAsWav(pcm: ByteArray, outFile: File) {
             FileOutputStream(outFile).use { fos ->
@@ -536,7 +613,8 @@ class LocalVoiceRecognizer(
                 val bitsPerSample = 16
                 val byteRate = SAMPLE_RATE_HZ * numChannels * bitsPerSample / 8
                 val blockAlign = (numChannels * bitsPerSample / 8).toShort()
-                val dataSize = pcm.size
+                // 16-bit PCM must have an even number of bytes; pad if needed (avoids malformed WAV).
+                val dataSize = if (pcm.size % 2 == 0) pcm.size else pcm.size + 1
                 val riffChunkSize = 36 + dataSize
                 dos.writeBytes("RIFF")
                 writeLe32(dos, riffChunkSize)
@@ -552,6 +630,7 @@ class LocalVoiceRecognizer(
                 dos.writeBytes("data")
                 writeLe32(dos, dataSize)
                 dos.write(pcm)
+                if (pcm.size % 2 != 0) dos.write(0)
             }
         }
 
@@ -644,6 +723,21 @@ class LocalVoiceRecognizer(
 
     private fun downloadModelZip(targetZip: File) {
         if (targetZip.exists() && isPlausibleCompleteModelZip(targetZip)) return
+        lastDownloadProgressPostBytes = 0L
+        val fromBundled = BundledVoiceModels.tryCopyBundledVoskZip(context, targetZip) { read, total ->
+            when {
+                read == 0L -> postModelSetupUi(VoiceModelSetupUiState.Downloading(0L, total))
+                shouldPostDownloadProgress(read, total) || (total > 0L && read >= total) -> {
+                    lastDownloadProgressPostBytes = read
+                    postModelSetupUi(VoiceModelSetupUiState.Downloading(read, total))
+                }
+            }
+        }
+        if (fromBundled) {
+            val len = targetZip.length()
+            postModelSetupUi(VoiceModelSetupUiState.Downloading(len, len))
+            return
+        }
         val partFile = File(targetZip.parentFile, "${targetZip.name}.part")
         partFile.delete()
         val connection = URL(MODEL_URL).openConnection() as HttpURLConnection

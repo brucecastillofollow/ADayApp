@@ -29,5 +29,6 @@
 
 -keep class com.sun.jna.** { *; }
 -keep class org.vosk.** { *; }
+-keep class org.codeshipping.** { *; }
 
 -dontskipnonpubliclibraryclassmembers

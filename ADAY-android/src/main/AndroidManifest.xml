@@ -33,6 +33,7 @@
 
     <application
         android:name=".HabitsApplication"
+        android:largeHeap="true"
         android:allowBackup="true"
         android:backupAgent=".HabitsBackupAgent"
         android:icon="@mipmap/ic_launcher"

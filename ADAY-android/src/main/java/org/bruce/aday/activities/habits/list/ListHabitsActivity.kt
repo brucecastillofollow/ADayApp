@@ -48,6 +48,11 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat.checkSelfPermission
 import androidx.core.view.MenuItemCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.bruce.aday.BaseExceptionHandler
 import org.bruce.aday.HabitsApplication
 import org.bruce.aday.R
@@ -75,7 +80,10 @@ import org.bruce.aday.utils.restartWithFade
 import org.bruce.aday.voice.LocalVoiceRecognizer
 import org.bruce.aday.voice.VoiceModelSetupUiState
 import org.bruce.aday.voice.VoiceHabitCommand
-import org.bruce.aday.voice.VoiceHabitCommandParser
+import org.bruce.aday.voice.llm.LlamaInference
+import org.bruce.aday.voice.llm.TinyLlamaModelDownloader
+import org.bruce.aday.voice.llm.TinyLlamaModelFiles
+import org.bruce.aday.voice.llm.VoiceIntentPipeline
 
 class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
 
@@ -122,6 +130,10 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     private var voiceModelProgressDialog: AlertDialog? = null
     private var voiceModelProgressBar: ProgressBar? = null
     private var voiceModelProgressLabel: TextView? = null
+    private var llmDownloadDialog: AlertDialog? = null
+    private var llmDownloadProgressBar: ProgressBar? = null
+    private var llmDownloadProgressLabel: TextView? = null
+    private val voiceIntentScope = MainScope()
 
     private val localVoiceRecognizer by lazy {
         LocalVoiceRecognizer(
@@ -177,6 +189,29 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             Toast.makeText(this, R.string.voice_model_ready_tap_voice, Toast.LENGTH_LONG).show()
         }
         LocalVoiceRecognizer.onModelSetupUi = { applyVoiceModelSetupUi(it) }
+        localVoiceRecognizer.onPartialTranscript = { partial ->
+            showLiveCaption(partial)
+        }
+        if (consumeOpenLlmDownloadIntent()) {
+            mainHandler.post { startTinyLlamaDownloadFlow() }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (consumeOpenLlmDownloadIntent()) {
+            mainHandler.post { startTinyLlamaDownloadFlow() }
+        }
+    }
+
+    private fun consumeOpenLlmDownloadIntent(): Boolean {
+        val i = intent ?: return false
+        if (!i.getBooleanExtra(EXTRA_OPEN_LLM_DOWNLOAD, false)) {
+            return false
+        }
+        i.removeExtra(EXTRA_OPEN_LLM_DOWNLOAD)
+        return true
     }
 
     override fun onPrepareOptionsMenu(menu: Menu): Boolean {
@@ -194,10 +229,22 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             item.title = getString(R.string.voice_stop_recording)
             item.setIcon(android.R.drawable.ic_media_pause)
             MenuItemCompat.setIconTintList(item, android.content.res.ColorStateList.valueOf(Color.parseColor("#FF5252")))
+            rootView.tbar.subtitle = getString(R.string.voice_local_listening)
         } else {
             item.title = getString(R.string.voice_habit_command)
             item.setIcon(android.R.drawable.ic_btn_speak_now)
             MenuItemCompat.setIconTintList(item, null)
+            rootView.tbar.subtitle = null
+        }
+    }
+
+    private fun showLiveCaption(partial: String) {
+        if (!isVoiceRecording) return
+        val text = partial.trim()
+        rootView.tbar.subtitle = if (text.isBlank()) {
+            getString(R.string.voice_local_listening)
+        } else {
+            text
         }
     }
 
@@ -288,8 +335,142 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             startVoiceFlow()
             return true
         }
+        if (item.itemId == R.id.actionDownloadVoiceLlm) {
+            startTinyLlamaDownloadFlow()
+            return true
+        }
         invalidateOptionsMenu()
         return menu.onItemSelected(item)
+    }
+
+    private fun startTinyLlamaDownloadFlow() {
+        val f = TinyLlamaModelFiles.modelFile(this)
+        if (TinyLlamaModelDownloader.isPlausibleModelFile(f)) {
+            Toast.makeText(this, R.string.voice_llm_already_downloaded, Toast.LENGTH_SHORT).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.voice_llm_download_title)
+            .setMessage(R.string.voice_llm_download_message)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.voice_llm_download_confirm) { _, _ ->
+                // Let the confirm dialog finish dismissing so the progress dialog is visible on top.
+                mainHandler.post { runTinyLlamaDownload() }
+            }
+            .show()
+    }
+
+    private fun runTinyLlamaDownload() {
+        ensureLlmDownloadDialogShown()
+        val app = application as HabitsApplication
+        val appCtx = applicationContext
+        app.applicationCoroutineScope.launch(Dispatchers.IO) {
+            try {
+                TinyLlamaModelDownloader.downloadModel(appCtx) { read, total ->
+                    mainHandler.post {
+                        if (isFinishing || isDestroyed) {
+                            return@post
+                        }
+                        applyLlmDownloadProgress(read, total)
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    if (!isFinishing && !isDestroyed) {
+                        dismissLlmDownloadDialog()
+                        Toast.makeText(this@ListHabitsActivity, R.string.voice_llm_download_done, Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(appCtx, R.string.voice_llm_download_done, Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("ADayVoiceLlm", "llm download failed", e)
+                withContext(Dispatchers.Main) {
+                    if (!isFinishing && !isDestroyed) {
+                        dismissLlmDownloadDialog()
+                        Toast.makeText(this@ListHabitsActivity, R.string.voice_llm_download_failed, Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(appCtx, R.string.voice_llm_download_failed, Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun applyLlmDownloadProgress(bytesRead: Long, totalBytes: Long) {
+        val bar = llmDownloadProgressBar ?: return
+        val label = llmDownloadProgressLabel ?: return
+        val knownTotal = totalBytes > 0L
+        // While total size is unknown, or we have not read body bytes yet, show animated indeterminate bar.
+        val showIndeterminate = !knownTotal || bytesRead == 0L
+        bar.isIndeterminate = showIndeterminate
+        if (knownTotal && bytesRead > 0L) {
+            bar.max = 10000
+            bar.progress = ((bytesRead * 10000L) / totalBytes).toInt().coerceIn(1, 10000)
+        }
+        val readStr = Formatter.formatFileSize(this, bytesRead)
+        label.text = when {
+            bytesRead == 0L && knownTotal -> getString(
+                R.string.voice_model_progress_download_known,
+                readStr,
+                Formatter.formatFileSize(this, totalBytes),
+            )
+            bytesRead == 0L -> getString(R.string.voice_llm_download_preparing)
+            knownTotal -> getString(
+                R.string.voice_model_progress_download_known,
+                readStr,
+                Formatter.formatFileSize(this, totalBytes),
+            )
+            else -> getString(R.string.voice_model_progress_download_unknown, readStr)
+        }
+    }
+
+    private fun ensureLlmDownloadDialogShown() {
+        if (llmDownloadDialog?.isShowing == true) return
+        // Do not use [dismissCurrentAndShow]: [onPause] calls [dismissCurrentDialog] and would
+        // dismiss this progress dialog (e.g. when a full-screen ad opens), hiding download progress.
+        dismissCurrentDialog()
+        val dialog = createLlmDownloadProgressDialog()
+        llmDownloadDialog = dialog
+        dialog.show()
+    }
+
+    private fun createLlmDownloadProgressDialog(): AlertDialog {
+        val density = resources.displayMetrics.density
+        val pad = (24 * density).toInt()
+        val gap = (8 * density).toInt()
+        val barHeight = (12 * density).toInt().coerceAtLeast(1)
+        val label = TextView(this).apply {
+            setPadding(0, 0, 0, gap)
+            setText(R.string.voice_llm_download_preparing)
+        }
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 10000
+            isIndeterminate = true
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                barHeight,
+            )
+        }
+        llmDownloadProgressLabel = label
+        llmDownloadProgressBar = bar
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+            addView(label)
+            addView(bar)
+        }
+        return AlertDialog.Builder(this)
+            .setTitle(R.string.voice_llm_progress_title)
+            .setView(container)
+            .setCancelable(false)
+            .create()
+    }
+
+    private fun dismissLlmDownloadDialog() {
+        llmDownloadDialog?.dismiss()
+        llmDownloadDialog = null
+        llmDownloadProgressBar = null
+        llmDownloadProgressLabel = null
     }
 
     private fun startVoiceFlow() {
@@ -346,6 +527,46 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         }
         voiceOutcomeRunnable = runnable
         mainHandler.postDelayed(runnable, VOICE_OUTCOME_DELAY_MS)
+    }
+
+    private fun showVoiceProcessingState(transcriptPreview: String) {
+        if (isFinishing || isDestroyed) return
+        rootView.tbar.subtitle = getString(R.string.voice_processing_command)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(this, POST_NOTIFICATIONS) != PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    VOICE_PROCESSING_CHANNEL_ID,
+                    getString(R.string.voice_processing_channel),
+                    NotificationManager.IMPORTANCE_DEFAULT,
+                ),
+            )
+        }
+        val preview = transcriptPreview.replace("\n", " ").trim().take(120)
+            .ifBlank { getString(R.string.voice_not_recognized) }
+        val builder = NotificationCompat.Builder(this, VOICE_PROCESSING_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.voice_processing_command))
+            .setContentText(preview)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(preview))
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setProgress(0, 0, true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+        nm.notify(VOICE_PROCESSING_NOTIFICATION_ID, builder.build())
+    }
+
+    private fun clearVoiceProcessingState() {
+        if (!isFinishing && !isDestroyed) {
+            rootView.tbar.subtitle = null
+        }
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.cancel(VOICE_PROCESSING_NOTIFICATION_ID)
     }
 
     /**
@@ -427,11 +648,28 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     }
 
     private fun deliverVoiceOutcome(transcript: String) {
-        val command = VoiceHabitCommandParser.parse(transcript)
+        val habitNames = appComponent.habitList.map { it.name }
+        showVoiceProcessingState(transcript)
+        voiceIntentScope.launch(Dispatchers.Default) {
+            try {
+                val command = VoiceIntentPipeline.resolve(this@ListHabitsActivity, transcript, habitNames)
+                withContext(Dispatchers.Main) {
+                    applyVoiceCommandOutcome(transcript, command)
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    clearVoiceProcessingState()
+                }
+            }
+        }
+    }
+
+    private fun applyVoiceCommandOutcome(transcript: String, command: VoiceHabitCommand?) {
         Log.i(
             "ADayVoice",
             "voice_outcome raw=\"${transcript.replace("\n", " ")}\" parsed=${command?.javaClass?.simpleName}",
         )
+        showVoiceAndLlmResultDialog(transcript, command)
         when (command) {
             is VoiceHabitCommand.AddHabit -> {
                 Toast.makeText(this, R.string.voice_understood, Toast.LENGTH_SHORT).show()
@@ -451,6 +689,26 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             }
             null -> Toast.makeText(this, R.string.voice_not_recognized, Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun showVoiceAndLlmResultDialog(transcript: String, command: VoiceHabitCommand?) {
+        val snapshot = LlamaInference.debugSnapshot()
+        val rawCompact = snapshot.rawOutput.replace("\n", " ").trim().take(700).ifBlank { "(empty)" }
+        val action = when (command) {
+            is VoiceHabitCommand.AddHabit -> "Add habit: ${command.name}"
+            is VoiceHabitCommand.MarkDone -> "Mark done: ${command.habitName}"
+            null -> "Not recognized"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Voice + LLM result")
+            .setMessage(
+                "Speech: $transcript\n\n" +
+                    "Action: $action\n\n" +
+                    "LLM parsed: ${snapshot.parsedSummary}\n\n" +
+                    "Raw: $rawCompact",
+            )
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
     }
 
     private fun addHabitFromVoice(name: String, showToast: Boolean = true) {
@@ -503,14 +761,12 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         intent = null
     }
 
-    override fun onNewIntent(intent: Intent?) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-    }
-
     override fun onDestroy() {
+        clearVoiceProcessingState()
+        voiceIntentScope.cancel()
         LocalVoiceRecognizer.onModelSetupUi = null
         dismissVoiceModelProgressDialog()
+        dismissLlmDownloadDialog()
         super.onDestroy()
     }
 
@@ -594,14 +850,19 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
 
     companion object {
         const val ACTION_EDIT = "org.bruce.aday.ACTION_EDIT"
+        /** Settings / deep link: open habits screen and start the TinyLlama GGUF download flow. */
+        const val EXTRA_OPEN_LLM_DOWNLOAD = "org.bruce.aday.extra.OPEN_LLM_DOWNLOAD"
         private var hasShownRewardedAdOnMain = false
         /** New id so channel importance can be upgraded (Android ignores updates to an existing channel id). */
         private const val VOICE_CHANNEL_ID = "voice_transcript_v2"
         private const val VOICE_STATUS_CHANNEL_ID = "voice_status_v1"
+        private const val VOICE_PROCESSING_CHANNEL_ID = "voice_processing_v1"
         private const val VOICE_TRANSCRIPT_NOTIFICATION_ID = 90421
         private const val VOICE_READY_NOTIFICATION_ID = 90420
+        private const val VOICE_PROCESSING_NOTIFICATION_ID = 90423
         private const val VOICE_NOTIFICATION_TIMEOUT_MS = 5000L
         private const val VOICE_READY_TIMEOUT_MS = 6000L
-        private const val VOICE_OUTCOME_DELAY_MS = 5000L
+        /** Short pause so the “Heard” notification can post before the processing spinner. */
+        private const val VOICE_OUTCOME_DELAY_MS = 200L
     }
 }

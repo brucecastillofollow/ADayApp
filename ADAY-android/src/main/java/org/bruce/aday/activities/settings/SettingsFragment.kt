@@ -38,6 +38,7 @@ import androidx.preference.PreferenceFragmentCompat
 import androidx.recyclerview.widget.RecyclerView
 import org.bruce.aday.HabitsApplication
 import org.bruce.aday.R
+import org.bruce.aday.activities.habits.list.ListHabitsActivity
 import org.bruce.aday.activities.habits.list.RESULT_BUG_REPORT
 import org.bruce.aday.activities.habits.list.RESULT_EXPORT_CSV
 import org.bruce.aday.activities.habits.list.RESULT_EXPORT_DB
@@ -148,6 +149,15 @@ class SettingsFragment : PreferenceFragmentCompat(), OnSharedPreferenceChangeLis
                         Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
                 )
                 startActivityForResult(intent, PUBLIC_BACKUP_REQUEST_CODE)
+                return true
+            }
+            "downloadVoiceLlm" -> {
+                startActivity(
+                    Intent(requireContext(), ListHabitsActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                        putExtra(ListHabitsActivity.EXTRA_OPEN_LLM_DOWNLOAD, true)
+                    },
+                )
                 return true
             }
         }

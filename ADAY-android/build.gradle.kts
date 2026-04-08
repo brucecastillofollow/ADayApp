@@ -93,6 +93,11 @@ android {
     kotlinOptions.jvmTarget = JavaVersion.VERSION_17.toString()
     buildFeatures.viewBinding = true
     lint.abortOnError = false
+
+    // Large models in assets: avoid deflate so AssetFileDescriptor.length is reliable and install I/O stays sane.
+    androidResources {
+        noCompress += listOf("zip", "gguf")
+    }
 }
 
 dependencies {
@@ -128,6 +133,7 @@ dependencies {
     implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
     implementation(libs.opencsv)
     implementation(libs.konfetti.xml)
+    implementation(libs.llama.kotlin.android)
     implementation(project(":aday-core"))
     ksp(libs.dagger.compiler)
 

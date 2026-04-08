@@ -90,6 +90,12 @@
         app:showAsAction="never"/>
 
     <item
+        android:id="@+id/actionDownloadVoiceLlm"
+        android:orderInCategory="96"
+        android:title="@string/voice_llm_download_menu"
+        app:showAsAction="never"/>
+
+    <item
         android:id="@+id/actionSettings"
         android:orderInCategory="100"
         android:title="@string/action_settings"

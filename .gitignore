@@ -18,3 +18,7 @@ node_modules
 *.sketch
 crowdin.yml
 kotlin-js-store
+
+# Optional huge bundled models (drop locally to ship offline voice/LLM in APK)
+aday-android/src/main/assets/bundled/vosk/*.zip
+aday-android/src/main/assets/bundled/llm/*.gguf
