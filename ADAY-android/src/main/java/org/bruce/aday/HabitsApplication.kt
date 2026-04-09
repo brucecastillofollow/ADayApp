@@ -152,7 +152,7 @@ class HabitsApplication : Application() {
     }
 
     private fun startDeferredAdsAndOfflineModels() {
-        // Voice + Vosk first; Mobile Ads pulls GMS/Dynamite and can overlap mic work or GMS updates.
+        // Voice / Whisper model first; Mobile Ads pulls GMS/Dynamite and can overlap mic work or GMS updates.
         LocalLlamaRuntime.install()
         voiceModelPrefetch = LocalVoiceRecognizer(
             applicationContext,
@@ -177,7 +177,7 @@ class HabitsApplication : Application() {
 
         applicationScope.launch(Dispatchers.IO) {
             try {
-                // Stagger vs Vosk asset copy + unzip so first frame / DB / launcher transition are not
+                // Stagger vs Whisper speech-model download so first frame / DB / launcher transition are not
                 // competing with a ~750MB GGUF read+write on the same storage queue.
                 delay(6_000)
                 val f = TinyLlamaModelFiles.modelFile(applicationContext)
@@ -194,7 +194,7 @@ class HabitsApplication : Application() {
                     }
                 }
                 // Intentionally no warmupIfModelPresent(): loading the GGUF maps hundreds of MB of
-                // native RAM. With Vosk + Ads WebView on a 2–4 GB AVD, LMK kills the process
+                // native RAM. With Whisper + Ads WebView on a 2–4 GB AVD, LMK kills the process
                 // ("min watermark is breached"). The model loads on first voice command instead.
                 postLlmStartupNotification(
                     getString(R.string.voice_llm_file_on_device),

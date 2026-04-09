@@ -9,18 +9,20 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.MediaScannerConnection
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.provider.MediaStore
+import android.content.Intent
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.whispercpp.whisper.WhisperLib
 import org.bruce.aday.R
-import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
-import kotlin.math.min
 import java.io.BufferedInputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -29,20 +31,27 @@ import java.io.IOException
 import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
+import java.util.ArrayDeque
+import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.zip.ZipException
-import java.util.zip.ZipInputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.math.abs
+import kotlin.math.min
+import org.json.JSONObject
+import org.vosk.Model
+import org.vosk.Recognizer
+import org.vosk.android.RecognitionListener as VoskRecognitionListener
+import org.vosk.android.SpeechService
 
 /** Standard PCM WAV produced by [writeWavHeaderPlaceholder] (no extra chunks). */
 private const val WAV_HEADER_BYTES = 44
 
-private const val FINAL_RECOG_CHUNK_BYTES = 8192
-
-/** Backpressure for mic → disk / Vosk queues (each chunk is one [AudioRecord.read]). */
+/** Backpressure for mic → disk writer queue (each chunk is one [AudioRecord.read]). */
 private const val PCM_QUEUE_CAPACITY = 128
 
 /**
@@ -52,9 +61,11 @@ private const val PCM_QUEUE_CAPACITY = 128
 private val PCM_STREAM_END = ByteArray(0)
 
 /**
- * Offline Vosk with [AudioRecord]: one thread reads the mic and enqueues PCM copies; a writer thread
- * appends to a WAV file; a recognizer thread feeds Vosk for live captions. On stop, the WAV is
- * finalized and a **full-file** Vosk pass produces the transcript returned to the host.
+ * Voice capture routing:
+ * - **Online**: Android [SpeechRecognizer] (fast, uses Google servers when available).
+ * - **Offline**: Vosk on-device model (bundled or downloaded; no Whisper in this path).
+ *
+ * Legacy Whisper/WAV path remains in this file for reference but is not used for [ensureModelAndStart].
  */
 class LocalVoiceRecognizer(
     private val context: Context,
@@ -62,16 +73,24 @@ class LocalVoiceRecognizer(
     private val onListening: (Boolean) -> Unit = {},
 ) {
 
-    /** Invoked on the main thread when the session ends with silence (Vosk endpoint) or max duration. */
+    /** Invoked on the main thread when the session ends (stop / max duration). */
     var onTimeoutWithTranscript: ((String) -> Unit)? = null
     /** Invoked on the main thread with live partial speech text while recording. */
     var onPartialTranscript: ((String) -> Unit)? = null
+
+    /**
+     * Main thread: non-null while offline Whisper is transcribing after recording; null when that phase ends.
+     * Host can drive status bar + ongoing notification without blocking the audio pipeline thread.
+     */
+    var onProcessingStatus: ((String?) -> Unit)? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var modelLoadThread: Thread? = null
     private var captureThread: Thread? = null
     private var wavWriterThread: Thread? = null
-    private var liveRecognizerThread: Thread? = null
+    private var liveCaptionThread: Thread? = null
+    private var androidSpeechRecognizer: SpeechRecognizer? = null
+    private var androidSpeechRestartRunnable: Runnable? = null
 
     /** Set while the mic is open so [signalCaptureStop] can unblock [AudioRecord.read]. */
     @Volatile
@@ -92,6 +111,21 @@ class LocalVoiceRecognizer(
     private var sessionFinishInProgress: Boolean = false
 
     private val sessionLock = Any()
+    private val whisperLock = ReentrantLock()
+    private val liveWhisperLock = ReentrantLock()
+
+    private enum class VoiceRoute {
+        NONE,
+        ONLINE_ANDROID_SR,
+        OFFLINE_VOSK,
+    }
+
+    private var voiceRoute = VoiceRoute.NONE
+
+    /** Vosk streaming session (offline). */
+    private var voskSpeechService: SpeechService? = null
+
+    private var onlineStopLatch: CountDownLatch? = null
 
     /** Set when [ModelSetupCancelled] (user stopped or setup interrupted before capture). */
     @Volatile
@@ -122,10 +156,12 @@ class LocalVoiceRecognizer(
         return t != null && t.isAlive
     }
 
-    /** True while the offline model is loading and not yet cached (first launch or after clear data). */
+    /** True while the offline Vosk model is loading and not yet cached (first launch or after clear data). */
     fun isModelLoadInProgress(): Boolean {
-        val t = modelLoadThread
-        return cachedModel == null && t != null && t.isAlive
+        val t = modelLoadThread ?: return false
+        if (!t.isAlive) return false
+        if (NetworkConnectivity.isLikelyOnline(context)) return false
+        return cachedVoskModel == null
     }
 
     /**
@@ -161,13 +197,15 @@ class LocalVoiceRecognizer(
     }
 
     /**
-     * Starts download / unpack / native load of the offline Vosk model in a background thread
-     * without opening the microphone. Safe to call from [android.app.Application.onCreate]; pairs
-     * with [start] when the user uses voice (reuses [cachedModel] if already loaded).
+     * Prefetches offline Vosk model when device is offline-capable path; skips when online (network SR).
      */
     fun prefetchModelIfNeeded() {
-        if (cachedModel != null) {
-            Log.i(LOG_TAG, "prefetch_model: already cached")
+        if (NetworkConnectivity.isLikelyOnline(context)) {
+            Log.i(LOG_TAG, "prefetch_model: skipped (online — system speech recognizer)")
+            return
+        }
+        if (cachedVoskModel != null) {
+            Log.i(LOG_TAG, "prefetch_model: vosk already cached")
             return
         }
         synchronized(sessionLock) {
@@ -181,7 +219,7 @@ class LocalVoiceRecognizer(
             }
             loadCancelled = false
         }
-        startModelLoadThread(startCaptureAfterLoad = false, prefetchFromApp = true)
+        startVoskModelLoadThread(startListeningAfterLoad = false, prefetchFromApp = true)
     }
 
     fun stop() {
@@ -234,22 +272,67 @@ class LocalVoiceRecognizer(
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        joinCapturePipeline(CAPTURE_JOIN_MS)
         modelLoadThread?.interrupt()
         modelLoadThread = null
+        when (voiceRoute) {
+            VoiceRoute.ONLINE_ANDROID_SR -> shutdownOnlineRecognizerAndWaitForResult()
+            VoiceRoute.OFFLINE_VOSK -> shutdownVoskOnMainThread()
+            else -> joinCapturePipeline(CAPTURE_JOIN_MS)
+        }
         postListening(false)
     }
 
-    private fun signalCaptureStop() {
-        try {
-            captureAudioRecord?.stop()
-        } catch (_: Exception) {
+    private fun shutdownOnlineRecognizerAndWaitForResult() {
+        val latch = CountDownLatch(1)
+        onlineStopLatch = latch
+        mainHandler.post {
+            try {
+                androidSpeechRecognizer?.stopListening()
+            } catch (_: Exception) {
+                latch.countDown()
+            }
         }
+        latch.await(25, TimeUnit.SECONDS)
+        onlineStopLatch = null
     }
 
-    /**
-     * Joins mic capture, WAV writer, and live Vosk; then runs full-file recognition and export.
-     */
+    private fun shutdownVoskOnMainThread() {
+        val latch = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                voskSpeechService?.stop()
+                voskSpeechService?.shutdown()
+            } catch (_: Exception) {
+            }
+            voskSpeechService = null
+            latch.countDown()
+        }
+        latch.await(5, TimeUnit.SECONDS)
+    }
+
+    private fun signalCaptureStop() {
+        when (voiceRoute) {
+            VoiceRoute.ONLINE_ANDROID_SR -> mainHandler.post {
+                try {
+                    androidSpeechRecognizer?.stopListening()
+                } catch (_: Exception) {
+                }
+            }
+            VoiceRoute.OFFLINE_VOSK -> mainHandler.post {
+                try {
+                    voskSpeechService?.stop()
+                } catch (_: Exception) {
+                }
+            }
+            else -> try {
+                captureAudioRecord?.stop()
+            } catch (_: Exception) {
+            }
+        }
+        stopAndroidRecognizerLiveCaption()
+    }
+
+    /** Joins mic capture and WAV writer, then runs Whisper transcription and export. */
     private fun joinCapturePipeline(ms: Long) {
         try {
             captureThread?.join(ms)
@@ -258,17 +341,17 @@ class LocalVoiceRecognizer(
         }
         captureThread = null
         try {
+            liveCaptionThread?.join(ms.coerceAtMost(LIVE_CAPTION_JOIN_MS))
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        liveCaptionThread = null
+        try {
             wavWriterThread?.join(ms)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
         wavWriterThread = null
-        try {
-            liveRecognizerThread?.join(ms)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
-        liveRecognizerThread = null
         finalizeSessionWavAndTranscript()
     }
 
@@ -278,27 +361,45 @@ class LocalVoiceRecognizer(
      */
     private fun finalizeSessionWavAndTranscript() {
         val wav = sessionWavFile
-        val model = cachedModel
+        val ctx = cachedWhisperContext
         sessionWavFile = null
-        if (wav == null || model == null) {
+        if (wav == null || ctx == 0L) {
             return
         }
         if (!wav.isFile || wav.length() < WAV_HEADER_BYTES) {
             Log.w(LOG_TAG, "voice_session_wav_missing_or_short path=${wav.absolutePath}")
             return
         }
+        postProcessingStatus(context.getString(R.string.voice_status_whisper_transcribing))
         try {
             val wavBytes = wav.readBytes()
             val pcm = readPcmPayloadFromWavBytes(wavBytes)
-            val text = runFinalRecognitionFromPcm(model, pcm)
-            lastTranscript = text
+            // WAV on disk unchanged; Whisper only sees PCM after trimming leading/trailing silence.
+            val trimmedPcm = trimSilence16kMonoPcm16le(pcm)
+            if (trimmedPcm.isEmpty()) {
+                Log.w(
+                    LOG_TAG,
+                    "voice_whisper_skipped_no_speech_after_trim rawPcmBytes=${pcm.size}",
+                )
+                lastTranscript = ""
+            } else {
+                Log.i(
+                    LOG_TAG,
+                    "voice_pcm_ready_for_whisper rawPcmBytes=${pcm.size} trimmedPcmBytes=${trimmedPcm.size}",
+                )
+                val text = transcribePcmWithWhisper(ctx, trimmedPcm)
+                lastTranscript = text
+            }
+            val text = lastTranscript
             Log.i(
                 LOG_TAG,
-                "voice_final_from_file path=${wav.absolutePath} pcmBytes=${pcm.size} transcript=\"$text\"",
+                "voice_final_from_file path=${wav.absolutePath} pcmBytes=${pcm.size} trimmedPcmBytes=${trimmedPcm.size} transcript=\"$text\"",
             )
             exportWavToPublicDownloads(context, wavBytes, wav.name)
         } catch (e: Exception) {
             Log.e(LOG_TAG, "voice_finalize_wav_failed", e)
+        } finally {
+            postProcessingStatus(null)
         }
     }
 
@@ -306,8 +407,16 @@ class LocalVoiceRecognizer(
         mainHandler.post { onListening(listening) }
     }
 
+    private fun postPartialTranscript(text: String) {
+        mainHandler.post { onPartialTranscript?.invoke(text) }
+    }
+
+    private fun postProcessingStatus(status: String?) {
+        mainHandler.post { onProcessingStatus?.invoke(status) }
+    }
+
     /**
-     * Called once after the offline speech model is fully ready: Vosk progress UI has been
+     * Called once after the offline speech model is fully ready: download/load progress UI has been
      * dismissed and capture may start (or prefetch completed). Posted on the main thread.
      * See [onSpeechModelReady] and [org.bruce.aday.voice.llm.PendingTinyLlamaAutoShow].
      */
@@ -322,14 +431,24 @@ class LocalVoiceRecognizer(
     }
 
     private fun ensureModelAndStart() {
-        if (cachedModel != null) {
-            startCaptureLoop(cachedModel!!, notifySpeechReady = false)
+        voiceRoute = if (NetworkConnectivity.isLikelyOnline(context)) {
+            VoiceRoute.ONLINE_ANDROID_SR
+        } else {
+            VoiceRoute.OFFLINE_VOSK
+        }
+        Log.i(LOG_TAG, "voice_route=${voiceRoute.name}")
+        if (voiceRoute == VoiceRoute.ONLINE_ANDROID_SR) {
+            startOnlineSpeechRecognizerSession()
             return
         }
-        startModelLoadThread(startCaptureAfterLoad = true, prefetchFromApp = false)
+        if (cachedVoskModel != null) {
+            startOfflineVoskListeningSession()
+            return
+        }
+        startVoskModelLoadThread(startListeningAfterLoad = true, prefetchFromApp = false)
     }
 
-    private fun startModelLoadThread(startCaptureAfterLoad: Boolean, prefetchFromApp: Boolean) {
+    private fun startVoskModelLoadThread(startListeningAfterLoad: Boolean, prefetchFromApp: Boolean) {
         synchronized(sessionLock) {
             if (modelLoadThread?.isAlive == true) {
                 Log.i(LOG_TAG, "model_load_already_in_progress — ignoring duplicate start")
@@ -338,15 +457,27 @@ class LocalVoiceRecognizer(
         }
         modelLoadThread = Thread {
             try {
-                val modelPath = ensureModelDir()
+                postModelSetupUi(VoiceModelSetupUiState.Downloading(0L, -1L))
+                val dir = VoskModelPreparer.ensureModelReady(
+                    context,
+                    { loadCancelled },
+                ) { read, total ->
+                    postModelSetupUi(VoiceModelSetupUiState.Downloading(read, total))
+                }
                 if (loadCancelled) return@Thread
+                if (dir == null) {
+                    throw IllegalStateException("Vosk model could not be prepared")
+                }
                 postModelSetupUi(VoiceModelSetupUiState.LoadingVosk)
-                val model = Model(modelPath.absolutePath)
-                if (loadCancelled) return@Thread
-                cachedModel = model
-                if (!startCaptureAfterLoad) {
+                val model = Model(dir.absolutePath)
+                if (loadCancelled) {
+                    model.close()
+                    return@Thread
+                }
+                cachedVoskModel = model
+                if (!startListeningAfterLoad) {
                     postModelSetupUi(VoiceModelSetupUiState.Dismiss)
-                    Log.i(LOG_TAG, "prefetch_model_complete")
+                    Log.i(LOG_TAG, "prefetch_vosk_model_complete")
                     notifySpeechModelReady()
                     return@Thread
                 }
@@ -358,24 +489,173 @@ class LocalVoiceRecognizer(
                     mainHandler.post { onDeferredModelReady?.invoke() }
                     return@Thread
                 }
-                startCaptureLoop(model, notifySpeechReady = true)
+                mainHandler.post { startOfflineVoskListeningSession() }
             } catch (_: ModelSetupCancelled) {
                 if (!prefetchFromApp) {
                     setupCancelledForSession = true
                 }
                 postModelSetupUi(VoiceModelSetupUiState.Dismiss)
                 Log.i(LOG_TAG, "model_setup_cancelled")
+            } catch (e: VoskModelPreparer.DownloadCancelled) {
+                postModelSetupUi(VoiceModelSetupUiState.Dismiss)
+                Log.i(LOG_TAG, "vosk_download_cancelled")
             } catch (e: Exception) {
                 postModelSetupUi(VoiceModelSetupUiState.Dismiss)
                 if (!loadCancelled) {
                     if (prefetchFromApp) {
-                        Log.w(LOG_TAG, "prefetch offline model failed", e)
+                        Log.w(LOG_TAG, "prefetch vosk model failed", e)
                     } else {
-                        mainHandler.post { onError("Offline model setup failed: ${e.message}") }
+                        mainHandler.post { onError("Offline speech model setup failed: ${e.message}") }
                     }
                 }
             }
         }.also { it.start() }
+    }
+
+    /**
+     * [SpeechRecognizer.ERROR_TOO_MANY_REQUESTS]: system throttled online ASR — continue with Vosk
+     * so the user does not have to wait or retry manually.
+     */
+    private fun tryFallbackToOfflineVoskFromOnlineRateLimit(error: Int): Boolean {
+        if (error != SpeechRecognizer.ERROR_TOO_MANY_REQUESTS) return false
+        if (voiceRoute != VoiceRoute.ONLINE_ANDROID_SR) return false
+        if (loadCancelled || sessionFinishInProgress) return false
+        Log.i(LOG_TAG, "online_sr_rate_limited — falling back to offline Vosk")
+        voiceRoute = VoiceRoute.OFFLINE_VOSK
+        try {
+            androidSpeechRecognizer?.cancel()
+        } catch (_: Exception) {
+        }
+        try {
+            androidSpeechRecognizer?.destroy()
+        } catch (_: Exception) {
+        }
+        androidSpeechRecognizer = null
+        onlineStopLatch?.countDown()
+        when {
+            cachedVoskModel != null -> startOfflineVoskListeningSession()
+            else -> startVoskModelLoadThread(startListeningAfterLoad = true, prefetchFromApp = false)
+        }
+        return true
+    }
+
+    private fun startOnlineSpeechRecognizerSession() {
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+            mainHandler.post { onError(context.getString(R.string.voice_sr_not_available)) }
+            return
+        }
+        mainHandler.post {
+            try {
+                androidSpeechRecognizer?.destroy()
+                val sr = SpeechRecognizer.createSpeechRecognizer(context.applicationContext)
+                androidSpeechRecognizer = sr
+                sr.setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {}
+                    override fun onBeginningOfSpeech() {}
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {}
+                    override fun onError(error: Int) {
+                        Log.w(LOG_TAG, "online_sr_error code=$error")
+                        if (tryFallbackToOfflineVoskFromOnlineRateLimit(error)) {
+                            return
+                        }
+                        if (error != SpeechRecognizer.ERROR_CLIENT) {
+                            lastTranscript = ""
+                        }
+                        onlineStopLatch?.countDown()
+                        postListening(false)
+                    }
+                    override fun onResults(results: Bundle?) {
+                        val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        lastTranscript = list?.firstOrNull()?.trim().orEmpty()
+                        Log.i(LOG_TAG, "online_sr_result text=\"$lastTranscript\"")
+                        onlineStopLatch?.countDown()
+                        postListening(false)
+                    }
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        val p = list?.firstOrNull()?.trim().orEmpty()
+                        if (p.isNotEmpty()) postPartialTranscript(p)
+                    }
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
+                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                }
+                sr.startListening(intent)
+                postListening(true)
+                notifySpeechModelReady()
+                Log.i(LOG_TAG, "online_android_sr_started")
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "online_sr_start_failed", e)
+                mainHandler.post { onError(e.message ?: "Speech recognition failed") }
+            }
+        }
+    }
+
+    private fun startOfflineVoskListeningSession() {
+        val model = cachedVoskModel
+        if (model == null) {
+            mainHandler.post { onError("Offline speech model not loaded") }
+            return
+        }
+        mainHandler.post {
+            try {
+                voskSpeechService?.stop()
+                voskSpeechService?.shutdown()
+                val recognizer = Recognizer(model, 16000.0f)
+                val service = SpeechService(recognizer, 16000.0f)
+                voskSpeechService = service
+                service.startListening(object : VoskRecognitionListener {
+                    override fun onPartialResult(hypothesis: String) {
+                        val t = parseVoskJson(hypothesis, partial = true)
+                        if (t.isNotEmpty()) postPartialTranscript(t)
+                    }
+
+                    override fun onResult(hypothesis: String) {
+                        val t = parseVoskJson(hypothesis, partial = false)
+                        if (t.isNotEmpty()) {
+                            lastTranscript = t
+                            Log.i(LOG_TAG, "vosk_result text=\"$lastTranscript\"")
+                        }
+                    }
+
+                    override fun onFinalResult(hypothesis: String) {
+                        val t = parseVoskJson(hypothesis, partial = false)
+                        if (t.isNotEmpty()) {
+                            lastTranscript = t
+                            Log.i(LOG_TAG, "vosk_final text=\"$lastTranscript\"")
+                        }
+                    }
+
+                    override fun onError(exception: Exception) {
+                        Log.w(LOG_TAG, "vosk_recognition_error", exception)
+                    }
+
+                    override fun onTimeout() {
+                        Log.i(LOG_TAG, "vosk_timeout")
+                    }
+                })
+                postListening(true)
+                notifySpeechModelReady()
+                Log.i(LOG_TAG, "offline_vosk_listening_started")
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "vosk_start_failed", e)
+                mainHandler.post { onError("Offline speech failed: ${e.message}") }
+            }
+        }
+    }
+
+    private fun parseVoskJson(json: String, partial: Boolean): String {
+        return try {
+            val o = JSONObject(json)
+            if (partial) o.optString("partial", "") else o.optString("text", "")
+        } catch (_: Exception) {
+            ""
+        }
     }
 
     /**
@@ -407,10 +687,10 @@ class LocalVoiceRecognizer(
     }
 
     /**
-     * @param notifySpeechReady only true the first time we open the mic after a fresh Vosk load
-     * (not when reusing [cachedModel] for a later session).
+     * @param notifySpeechReady only true the first time we open the mic after a fresh Whisper load
+     * (not when reusing cached context for a later session).
      */
-    private fun startCaptureLoop(model: Model, notifySpeechReady: Boolean) {
+    private fun startCaptureLoop(notifySpeechReady: Boolean) {
         postModelSetupUi(VoiceModelSetupUiState.Dismiss)
         if (notifySpeechReady) {
             notifySpeechModelReady()
@@ -436,7 +716,42 @@ class LocalVoiceRecognizer(
         sessionWavFile = wavFile
 
         val writerQueue = ArrayBlockingQueue<ByteArray>(PCM_QUEUE_CAPACITY)
-        val recognizerQueue = ArrayBlockingQueue<ByteArray>(PCM_QUEUE_CAPACITY)
+        val liveChunks = ArrayDeque<ByteArray>()
+        val liveChunkLock = Any()
+        var liveTotalBytes = 0
+        val liveCaptionRunning = AtomicBoolean(true)
+        val liveCaptionHasText = AtomicBoolean(false)
+        val liveContextPtr = if (ENABLE_LIVE_WHISPER_CAPTION) ensureLiveCaptionContextOrZero() else 0L
+
+        liveCaptionThread = Thread {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+            var lastCaption = ""
+            while (liveCaptionRunning.get()) {
+                try {
+                    Thread.sleep(LIVE_CAPTION_INTERVAL_MS)
+                    val ctx = liveContextPtr
+                    if (ctx == 0L) continue
+                    val snapshot = synchronized(liveChunkLock) {
+                        snapshotTailBytesLocked(liveChunks, LIVE_CAPTION_WINDOW_BYTES)
+                    }
+                    if (snapshot.size < MIN_LIVE_CAPTION_PCM_BYTES) continue
+                    val trimmed = trimSilence16kMonoPcm16le(snapshot)
+                    if (trimmed.size < MIN_LIVE_CAPTION_PCM_BYTES) continue
+                    val partial = transcribeLiveCaptionWithWhisperBlocking(ctx, trimmed).trim()
+                    if (partial.isNotEmpty() && partial != lastCaption) {
+                        lastCaption = partial
+                        liveCaptionHasText.set(true)
+                        postPartialTranscript(partial)
+                        Log.i(LOG_TAG, "voice_live_caption text=\"$partial\"")
+                    }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return@Thread
+                } catch (_: Throwable) {
+                    // Keep live caption best-effort; final transcription still runs on stop.
+                }
+            }
+        }
 
         wavWriterThread = Thread {
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
@@ -466,51 +781,6 @@ class LocalVoiceRecognizer(
             }
         }
 
-        liveRecognizerThread = Thread {
-            val recognizer = Recognizer(model, SAMPLE_RATE)
-            var lastPartialPosted = ""
-            val finalizedSegments = mutableListOf<String>()
-            try {
-                while (true) {
-                    val chunk = recognizerQueue.take()
-                    if (chunk === PCM_STREAM_END) break
-                    val accepted = recognizer.acceptWaveForm(chunk, chunk.size)
-                    val partialText = parseHypothesis(recognizer.partialResult)
-                    val liveCaption = joinFinalizedAndPartial(finalizedSegments, partialText)
-                    if (liveCaption.isNotEmpty()) {
-                        lastTranscript = liveCaption
-                        if (liveCaption != lastPartialPosted) {
-                            lastPartialPosted = liveCaption
-                            mainHandler.post { onPartialTranscript?.invoke(liveCaption) }
-                        }
-                    }
-                    if (accepted) {
-                        parseHypothesis(recognizer.result)?.let { segment ->
-                            val s = segment.trim()
-                            if (s.isNotEmpty()) {
-                                finalizedSegments.add(s)
-                                val committed = joinFinalizedAndPartial(finalizedSegments, null)
-                                lastTranscript = committed
-                                if (committed != lastPartialPosted) {
-                                    lastPartialPosted = committed
-                                    mainHandler.post { onPartialTranscript?.invoke(committed) }
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                if (!loadCancelled) {
-                    Log.e(LOG_TAG, "voice_live_recognizer_failed", e)
-                }
-            } finally {
-                try {
-                    recognizer.close()
-                } catch (_: Exception) {
-                }
-            }
-        }
-
         captureThread = Thread {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
             var audioRecord: AudioRecord? = null
@@ -532,10 +802,10 @@ class LocalVoiceRecognizer(
                     mainHandler.post { onError("Microphone buffer size invalid") }
                     return@Thread
                 }
-                val hundredMsBytes = SAMPLE_RATE_HZ * 2 * 100 / 1000
-                var bufferSizeBytes = maxOf(minBuf * 4, hundredMsBytes)
+                val readChunkBytes = (SAMPLE_RATE_HZ * 2 * CAPTURE_READ_CHUNK_MS) / 1000
+                var bufferSizeBytes = maxOf(minBuf, readChunkBytes * 4)
                 if (bufferSizeBytes % 2 != 0) bufferSizeBytes++
-                val byteBuf = ByteArray(bufferSizeBytes)
+                val byteBuf = ByteArray(readChunkBytes)
                 audioRecord = openAudioRecordOrNull(bufferSizeBytes)
                 if (audioRecord == null || audioRecord.state != AudioRecord.STATE_INITIALIZED) {
                     audioRecord?.release()
@@ -550,30 +820,61 @@ class LocalVoiceRecognizer(
                     waitMs += 5
                 }
                 postListening(true)
-                var liveCaptionDropLogged = false
+                startAndroidRecognizerLiveCaption()
+                var lastLiveUiMs = 0L
+                val startedAtMs = System.currentTimeMillis()
+                var totalPcmBytes = 0L
+                postPartialTranscript("")
+                if (liveContextPtr != 0L) {
+                    liveCaptionThread?.start()
+                }
                 while (!loadCancelled) {
-                    val nBytes = audioRecord.read(byteBuf, 0, byteBuf.size)
+                    val now = System.currentTimeMillis()
+                    if (now - startedAtMs >= MAX_CAPTURE_MS) {
+                        Log.i(LOG_TAG, "voice_capture_max_duration_reached maxMs=$MAX_CAPTURE_MS")
+                        break
+                    }
+                    val nBytes = audioRecord.read(byteBuf, 0, byteBuf.size, AudioRecord.READ_NON_BLOCKING)
                     if (nBytes < 0) break
-                    if (nBytes == 0) continue
+                    if (nBytes == 0) {
+                        Thread.sleep(CAPTURE_IDLE_SLEEP_MS)
+                        continue
+                    }
                     val w = byteBuf.copyOfRange(0, nBytes)
-                    val r = w.copyOf()
                     writerQueue.put(w)
-                    if (!recognizerQueue.offer(r, 300, TimeUnit.MILLISECONDS)) {
-                        if (!liveCaptionDropLogged) {
-                            liveCaptionDropLogged = true
-                            Log.w(
-                                LOG_TAG,
-                                "live_recognizer_queue_full — dropping preview chunks only; WAV still records",
-                            )
+                    totalPcmBytes += nBytes
+                    if (liveContextPtr != 0L) {
+                        synchronized(liveChunkLock) {
+                            liveChunks.addLast(w)
+                            liveTotalBytes += w.size
+                            while (liveTotalBytes > LIVE_CAPTION_WINDOW_BYTES && liveChunks.isNotEmpty()) {
+                                liveTotalBytes -= liveChunks.removeFirst().size
+                            }
+                        }
+                    }
+                    if (now - lastLiveUiMs >= 500L) {
+                        lastLiveUiMs = now
+                        val elapsedSec = ((now - startedAtMs) / 1000L).coerceAtLeast(0L)
+                        // Do not overwrite recognized partial text once live caption has started.
+                        if (!liveCaptionHasText.get()) {
+                            postPartialTranscript("Listening... ${elapsedSec}s")
                         }
                     }
                 }
+                val capturedMs = (totalPcmBytes * 1000L) / (SAMPLE_RATE_HZ * 2L)
+                Log.i(
+                    LOG_TAG,
+                    "voice_capture_done pcmBytes=$totalPcmBytes approxMs=$capturedMs chunkMs=$CAPTURE_READ_CHUNK_MS",
+                )
             } catch (e: Exception) {
                 if (!loadCancelled) {
                     Log.e(LOG_TAG, "voice_capture: error", e)
                     mainHandler.post { onError("Offline recognition error: ${e.message}") }
                 }
             } finally {
+                liveCaptionRunning.set(false)
+                liveCaptionThread?.interrupt()
+                stopAndroidRecognizerLiveCaption()
                 try {
                     audioRecord?.stop()
                 } catch (_: Exception) {
@@ -581,13 +882,101 @@ class LocalVoiceRecognizer(
                 captureAudioRecord = null
                 audioRecord?.release()
                 offerPoisonOrDropOldest(writerQueue)
-                offerPoisonOrDropOldest(recognizerQueue)
             }
         }
 
         wavWriterThread!!.start()
-        liveRecognizerThread!!.start()
         captureThread!!.start()
+    }
+
+    private fun startAndroidRecognizerLiveCaption() {
+        if (!ENABLE_ANDROID_RECOGNIZER_CAPTION) return
+        mainHandler.post {
+            if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+                Log.w(LOG_TAG, "android_live_caption_unavailable")
+                return@post
+            }
+            androidSpeechRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+            val recognizer = androidSpeechRecognizer ?: SpeechRecognizer.createSpeechRecognizer(context).also {
+                androidSpeechRecognizer = it
+            }
+            val listener = object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {}
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val text = list?.firstOrNull()?.trim().orEmpty()
+                    if (text.isNotEmpty()) {
+                        postPartialTranscript(text)
+                    }
+                }
+                override fun onResults(results: Bundle?) {
+                    val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val text = list?.firstOrNull()?.trim().orEmpty()
+                    if (text.isNotEmpty()) {
+                        postPartialTranscript(text)
+                    }
+                    scheduleAndroidRecognizerRestart()
+                }
+                override fun onError(error: Int) {
+                    Log.i(LOG_TAG, "android_live_caption_error code=$error")
+                    scheduleAndroidRecognizerRestart()
+                }
+            }
+            recognizer.setRecognitionListener(listener)
+            startAndroidRecognizerListening(recognizer)
+            Log.i(LOG_TAG, "android_live_caption_started")
+        }
+    }
+
+    private fun scheduleAndroidRecognizerRestart() {
+        if (!ENABLE_ANDROID_RECOGNIZER_CAPTION || loadCancelled || !isCaptureActive()) return
+        androidSpeechRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+        androidSpeechRestartRunnable = Runnable {
+            val recognizer = androidSpeechRecognizer ?: return@Runnable
+            if (!loadCancelled && isCaptureActive()) {
+                startAndroidRecognizerListening(recognizer)
+            }
+        }
+        mainHandler.postDelayed(androidSpeechRestartRunnable!!, ANDROID_CAPTION_RESTART_DELAY_MS)
+    }
+
+    private fun startAndroidRecognizerListening(recognizer: SpeechRecognizer) {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        }
+        try {
+            recognizer.cancel()
+            recognizer.startListening(intent)
+        } catch (t: Throwable) {
+            Log.w(LOG_TAG, "android_live_caption_start_failed ${t.message}")
+        }
+    }
+
+    private fun stopAndroidRecognizerLiveCaption() {
+        if (!ENABLE_ANDROID_RECOGNIZER_CAPTION) return
+        mainHandler.post {
+            androidSpeechRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+            androidSpeechRestartRunnable = null
+            try {
+                androidSpeechRecognizer?.cancel()
+            } catch (_: Throwable) {
+            }
+            try {
+                androidSpeechRecognizer?.destroy()
+            } catch (_: Throwable) {
+            }
+            androidSpeechRecognizer = null
+            Log.i(LOG_TAG, "android_live_caption_stopped")
+        }
     }
 
     private fun writeWavHeaderPlaceholder(raf: RandomAccessFile) {
@@ -641,25 +1030,262 @@ class LocalVoiceRecognizer(
         }
     }
 
-    private fun runFinalRecognitionFromPcm(model: Model, pcm: ByteArray): String {
-        if (pcm.isEmpty()) return ""
-        val recognizer = Recognizer(model, SAMPLE_RATE)
-        try {
-            var offset = 0
-            while (offset < pcm.size) {
-                val n = min(FINAL_RECOG_CHUNK_BYTES, pcm.size - offset)
-                val slice = pcm.copyOfRange(offset, offset + n)
-                recognizer.acceptWaveForm(slice, slice.size)
-                offset += n
-            }
-            val json = recognizer.finalResult
-            return parseHypothesis(json)?.trim().orEmpty()
-        } finally {
+    /** 16 kHz mono s16le → float32 [-1,1] for [WhisperLib.fullTranscribe]. */
+    private fun transcribePcmWithWhisper(
+        contextPtr: Long,
+        pcmS16le: ByteArray,
+        timeoutMsOverride: Long? = null,
+        maxThreadsOverride: Int? = null,
+    ): String {
+        if (pcmS16le.isEmpty() || contextPtr == 0L) return ""
+        val timeoutMs = timeoutMsOverride ?: computeWhisperTimeoutMs(pcmS16le.size)
+        Log.i(
+            LOG_TAG,
+            "whisper_transcribe_begin samples=${pcmS16le.size / 2} pcmBytes=${pcmS16le.size} timeoutMs=$timeoutMs",
+        )
+        val holder = arrayOfNulls<String>(1)
+        val errorHolder = arrayOfNulls<Throwable>(1)
+        val worker = Thread {
             try {
-                recognizer.close()
-            } catch (_: Exception) {
+                holder[0] = transcribePcmWithWhisperBlocking(contextPtr, pcmS16le, maxThreadsOverride)
+            } catch (t: Throwable) {
+                errorHolder[0] = t
             }
         }
+        worker.start()
+        try {
+            worker.join(timeoutMs)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return ""
+        }
+        if (worker.isAlive) {
+            val audioMs = (pcmS16le.size.toLong() * 1000L) / (SAMPLE_RATE_HZ * 2L)
+            Log.w(
+                LOG_TAG,
+                "whisper_transcribe_timeout elapsedMs=$timeoutMs audioDurationMs=$audioMs samples=${pcmS16le.size / 2} " +
+                    "(decode did not finish in time → empty transcript; often slow CPU/emulator or long clip)",
+            )
+            // Avoid blocking finishSession forever. Native call may continue in this worker thread.
+            return ""
+        }
+        errorHolder[0]?.let { throw it }
+        return holder[0] ?: ""
+    }
+
+    private fun transcribePcmWithWhisperBlocking(
+        contextPtr: Long,
+        pcmS16le: ByteArray,
+        maxThreadsOverride: Int? = null,
+        tryLockOnly: Boolean = false,
+    ): String {
+        if (pcmS16le.isEmpty() || contextPtr == 0L) return ""
+        require(pcmS16le.size % 2 == 0) { "PCM length must be even" }
+        val nSamples = pcmS16le.size / 2
+        val floats = FloatArray(nSamples)
+        var o = 0
+        var i = 0
+        while (i < pcmS16le.size - 1) {
+            val lo = pcmS16le[i].toInt() and 0xff
+            val hi = pcmS16le[i + 1].toInt()
+            val s = (lo or (hi shl 8)).toShort().toInt()
+            floats[o++] = s / 32768.0f
+            i += 2
+        }
+        val threads = computeWhisperThreadCount(maxThreadsOverride)
+        logWhisperCpuAndThreads(threads, maxThreadsOverride)
+        val sb = StringBuilder()
+        val locked = if (tryLockOnly) whisperLock.tryLock() else run {
+            whisperLock.lock()
+            true
+        }
+        if (!locked) return ""
+        try {
+            WhisperLib.fullTranscribe(contextPtr, threads, floats)
+            val segCount = WhisperLib.getTextSegmentCount(contextPtr)
+            for (si in 0 until segCount) {
+                val t = WhisperLib.getTextSegment(contextPtr, si).trim()
+                if (t.isNotEmpty()) {
+                    if (sb.isNotEmpty()) sb.append(' ')
+                    sb.append(t)
+                }
+            }
+        } finally {
+            whisperLock.unlock()
+        }
+        val result = sb.toString().trim()
+        Log.i(
+            LOG_TAG,
+            "whisper_transcript_done chars=${result.length} text=\"$result\"",
+        )
+        return result
+    }
+
+    /**
+     * Logs how many logical CPUs the JVM reports and how many threads we pass to whisper_full.
+     * whisper.cpp typically scales up to a few cores; very high counts can add overhead on mobile.
+     */
+    private fun computeWhisperThreadCount(maxThreadsOverride: Int?): Int {
+        if (maxThreadsOverride != null) return maxThreadsOverride.coerceIn(1, 8)
+        val avail = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        return min(avail, WHISPER_THREAD_CAP_DEFAULT).coerceIn(1, 8)
+    }
+
+    private fun logWhisperCpuAndThreads(threadsUsed: Int, maxThreadsOverride: Int?) {
+        val avail = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        val typicalSweetSpot = min(avail, WHISPER_THREAD_CAP_DEFAULT).coerceAtLeast(1)
+        Log.i(
+            LOG_TAG,
+            "whisper_cpu_info availableProcessors=$avail threadsPassedToWhisper=$threadsUsed " +
+                "override=${maxThreadsOverride != null} defaultCap=$WHISPER_THREAD_CAP_DEFAULT whisperApiCap=8 " +
+                "typicalUsefulThreads≈1..$typicalSweetSpot (device-dependent; tune if slow)",
+        )
+    }
+
+    private fun transcribeLiveCaptionWithWhisperBlocking(contextPtr: Long, pcmS16le: ByteArray): String {
+        if (pcmS16le.isEmpty() || contextPtr == 0L) return ""
+        require(pcmS16le.size % 2 == 0) { "PCM length must be even" }
+        val nSamples = pcmS16le.size / 2
+        val floats = FloatArray(nSamples)
+        var o = 0
+        var i = 0
+        while (i < pcmS16le.size - 1) {
+            val lo = pcmS16le[i].toInt() and 0xff
+            val hi = pcmS16le[i + 1].toInt()
+            val s = (lo or (hi shl 8)).toShort().toInt()
+            floats[o++] = s / 32768.0f
+            i += 2
+        }
+        if (!liveWhisperLock.tryLock()) return ""
+        try {
+            WhisperLib.fullTranscribe(contextPtr, LIVE_CAPTION_MAX_THREADS, floats)
+            val segCount = WhisperLib.getTextSegmentCount(contextPtr)
+            if (segCount <= 0) return ""
+            val sb = StringBuilder()
+            for (si in 0 until segCount) {
+                val t = WhisperLib.getTextSegment(contextPtr, si).trim()
+                if (t.isNotEmpty()) {
+                    if (sb.isNotEmpty()) sb.append(' ')
+                    sb.append(t)
+                }
+            }
+            return sb.toString().trim()
+        } finally {
+            liveWhisperLock.unlock()
+        }
+    }
+
+    private fun ensureLiveCaptionContextOrZero(): Long {
+        val cached = cachedLiveCaptionWhisperContext
+        if (cached != 0L) return cached
+        synchronized(LIVE_CONTEXT_INIT_LOCK) {
+            val again = cachedLiveCaptionWhisperContext
+            if (again != 0L) return again
+            return try {
+                val modelFile = WhisperModelFiles.modelFile(context)
+                if (!modelFile.isFile || modelFile.length() < WhisperModelFiles.MIN_MODEL_BYTES) {
+                    Log.w(LOG_TAG, "live_caption_context_unavailable model_missing")
+                    0L
+                } else {
+                    val ptr = WhisperLib.initContext(modelFile.absolutePath)
+                    if (ptr == 0L) {
+                        Log.w(LOG_TAG, "live_caption_context_init_failed")
+                        0L
+                    } else {
+                        cachedLiveCaptionWhisperContext = ptr
+                        Log.i(LOG_TAG, "live_caption_context_ready")
+                        ptr
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(LOG_TAG, "live_caption_context_init_error ${t.message}")
+                0L
+            }
+        }
+    }
+
+    private fun snapshotTailBytesLocked(chunks: ArrayDeque<ByteArray>, maxBytes: Int): ByteArray {
+        if (chunks.isEmpty() || maxBytes <= 0) return ByteArray(0)
+        var need = maxBytes
+        var total = 0
+        val selected = ArrayDeque<ByteArray>()
+        val it = chunks.descendingIterator()
+        while (it.hasNext() && need > 0) {
+            val c = it.next()
+            selected.addFirst(c)
+            total += c.size
+            need -= c.size
+        }
+        if (total <= 0) return ByteArray(0)
+        val out = ByteArray(total)
+        var p = 0
+        for (c in selected) {
+            System.arraycopy(c, 0, out, p, c.size)
+            p += c.size
+        }
+        if (total <= maxBytes) return out
+        return out.copyOfRange(total - maxBytes, total)
+    }
+
+    /**
+     * Drops leading/trailing low-energy audio (silence / room noise) using short frames.
+     * Only the middle segment is returned for Whisper; exported WAV on disk stays full recording.
+     */
+    private fun trimSilence16kMonoPcm16le(pcmS16le: ByteArray): ByteArray {
+        if (pcmS16le.size < 2) return ByteArray(0)
+        val sampleCount = pcmS16le.size / 2
+        val frameSamples = (SAMPLE_RATE_HZ * TRIM_FRAME_MS) / 1000
+        if (frameSamples < 1) return ByteArray(0)
+        val numFrames = (sampleCount + frameSamples - 1) / frameSamples
+        var startSample = sampleCount
+        for (f in 0 until numFrames) {
+            val from = f * frameSamples
+            val to = minOf(from + frameSamples, sampleCount)
+            if (frameMeanAbsolute(pcmS16le, from, to) >= SILENCE_FRAME_MEAN_ABS_THRESHOLD) {
+                startSample = from
+                break
+            }
+        }
+        if (startSample >= sampleCount) return ByteArray(0)
+        var endExclusive = 0
+        for (f in numFrames - 1 downTo 0) {
+            val from = f * frameSamples
+            val to = minOf(from + frameSamples, sampleCount)
+            if (frameMeanAbsolute(pcmS16le, from, to) >= SILENCE_FRAME_MEAN_ABS_THRESHOLD) {
+                endExclusive = to
+                break
+            }
+        }
+        if (startSample >= endExclusive) return ByteArray(0)
+        val keepStart = (startSample - SILENCE_KEEP_PADDING_SAMPLES).coerceAtLeast(0)
+        val keepEndExclusive = (endExclusive + SILENCE_KEEP_PADDING_SAMPLES).coerceAtMost(sampleCount)
+        val out = pcmS16le.copyOfRange(keepStart * 2, keepEndExclusive * 2)
+        return if (out.size >= MIN_TRANSCRIBE_PCM_BYTES) out else ByteArray(0)
+    }
+
+    private fun frameMeanAbsolute(pcm: ByteArray, fromSample: Int, toSampleExclusive: Int): Double {
+        if (fromSample >= toSampleExclusive) return 0.0
+        var sum = 0L
+        var s = fromSample
+        while (s < toSampleExclusive) {
+            sum += sampleAbsAt(pcm, s)
+            s++
+        }
+        val n = toSampleExclusive - fromSample
+        return sum.toDouble() / n
+    }
+
+    private fun sampleAbsAt(pcmS16le: ByteArray, sampleIndex: Int): Int {
+        val i = sampleIndex * 2
+        val lo = pcmS16le[i].toInt() and 0xff
+        val hi = pcmS16le[i + 1].toInt()
+        return abs((lo or (hi shl 8)).toShort().toInt())
+    }
+
+    private fun computeWhisperTimeoutMs(pcmBytes: Int): Long {
+        val pcmMs = (pcmBytes.toLong() * 1000L) / (SAMPLE_RATE_HZ * 2L)
+        val scaled = WHISPER_TIMEOUT_BASE_MS + (pcmMs * WHISPER_TIMEOUT_MULTIPLIER_X10) / 10L
+        return scaled.coerceIn(WHISPER_TIMEOUT_BASE_MS, WHISPER_TIMEOUT_MAX_MS)
     }
 
     /**
@@ -762,48 +1388,8 @@ class LocalVoiceRecognizer(
         }
     }
 
-    private fun parseHypothesis(json: String): String? {
-        return try {
-            val obj = JSONObject(json)
-            val text = obj.optString("text").trim().ifBlank { null }
-                ?: obj.optString("partial").trim().ifBlank { null }
-            text
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    /**
-     * Vosk commits speech in **segments** (each [Recognizer.acceptWaveForm] true = one segment).
-     * Partials only cover the **current** segment, so we must join all segments for the full phrase.
-     */
-    private fun joinFinalizedAndPartial(segments: List<String>, partial: String?): String {
-        val base = segments.map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" ").trim()
-        val p = partial?.trim().orEmpty()
-        return when {
-            p.isEmpty() -> base
-            base.isEmpty() -> p
-            else -> "$base $p"
-        }
-    }
-
-    /** Appends [finalResult] tail (last unfinished utterance) without duplicating the last segment. */
-    private fun mergeFinalTail(segments: List<String>, tail: String?): String {
-        val base = segments.map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" ").trim()
-        val t = tail?.trim() ?: return base
-        if (t.isEmpty()) return base
-        if (base.isEmpty()) return t
-        if (base.endsWith(t, ignoreCase = true)) return base
-        val last = segments.lastOrNull()?.trim()
-        if (last != null && last.equals(t, ignoreCase = true)) return base
-        return "$base $t".trim()
-    }
-
     companion object {
         private const val LOG_TAG = "ADayVoice"
-        private const val MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip"
-        private const val MODEL_DIR = "vosk-model-en-us-0.22-lgraph"
-        private const val SAMPLE_RATE = 16000.0f
         private const val SAMPLE_RATE_HZ = 16000
         private const val SESSION_COMPLETE_DELAY_MS = 350L
         private const val CAPTURE_JOIN_MS = 8000L
@@ -811,13 +1397,64 @@ class LocalVoiceRecognizer(
         private const val MODEL_LOAD_JOIN_MS = 120_000L
         /** [stop] from [onStop] should not block long if model is still downloading. */
         private const val MODEL_LOAD_JOIN_SHORT_MS = 3_000L
-        /** vosk-model-en-us-0.22-lgraph.zip is ~128MB; smaller files are usually truncated downloads. */
-        private const val MIN_MODEL_ZIP_BYTES = 90_000_000L
-        private var cachedModel: Model? = null
+        /** Hard cap for command-mode capture (keeps latency predictable and files small). */
+        private const val MAX_CAPTURE_MS = 8_000L
+        /**
+         * Timeout for offline whisper_full. On emulators / low-power CPUs, decode can take many ×
+         * realtime; if this is too low you get empty transcript (timeout) even when audio is fine.
+         */
+        private const val WHISPER_TIMEOUT_BASE_MS = 25_000L
+        private const val WHISPER_TIMEOUT_MAX_MS = 300_000L
+        /** ~11× realtime budget: e.g. 4 s audio → ~25s + 44s ≈ 69 s cap before [WHISPER_TIMEOUT_MAX_MS]. */
+        private const val WHISPER_TIMEOUT_MULTIPLIER_X10 = 110L
+        /** Default thread count passed to whisper_full (avoid using every CPU — often slower on mobile). */
+        private const val WHISPER_THREAD_CAP_DEFAULT = 4
+        /** Keep final transcription strictly post-recording from WAV. */
+        private const val ENABLE_LIVE_WHISPER_CAPTION = false
+        /**
+         * Disabled by default because many devices do not allow SpeechRecognizer and AudioRecord
+         * to hold the mic at the same time; enabling can produce silent WAV captures.
+         */
+        private const val ENABLE_ANDROID_RECOGNIZER_CAPTION = false
+        private const val ANDROID_CAPTION_RESTART_DELAY_MS = 180L
+        private const val LIVE_CAPTION_INTERVAL_MS = 700L
+        private const val LIVE_CAPTION_MAX_THREADS = 2
+        private const val LIVE_CAPTION_JOIN_MS = 1_500L
+        private const val LIVE_CAPTION_WINDOW_BYTES = SAMPLE_RATE_HZ * 2 * 2
+        private const val MIN_LIVE_CAPTION_PCM_BYTES = SAMPLE_RATE_HZ * 2 / 4
+        /** Small non-blocking read chunk keeps stop latency close to user tap timing. */
+        private const val CAPTURE_READ_CHUNK_MS = 20
+        private const val CAPTURE_IDLE_SLEEP_MS = 8L
+        /** Trim very low-amplitude edges before transcription. */
+        /** Frame length for silence trim (mean absolute amplitude per frame). */
+        private const val TRIM_FRAME_MS = 20
+        /** Mean |sample| per frame below this is treated as silence (16-bit mono). */
+        private const val SILENCE_FRAME_MEAN_ABS_THRESHOLD = 110.0
+        private const val SILENCE_KEEP_PADDING_SAMPLES = (SAMPLE_RATE_HZ * 120) / 1000
+        private const val MIN_TRANSCRIBE_PCM_BYTES = (SAMPLE_RATE_HZ * 2 * 120) / 1000
+        private val LIVE_CONTEXT_INIT_LOCK = Any()
+        @Volatile
+        private var cachedWhisperContext: Long = 0L
+        @Volatile
+        private var cachedLiveCaptionWhisperContext: Long = 0L
 
-        /** True after the offline Vosk model is unpacked and loaded in memory. */
+        /** Loaded Vosk model (offline path); kept for the process lifetime. */
+        @Volatile
+        var cachedVoskModel: Model? = null
+
+        /** Online: system SR available. Offline: Vosk model loaded. */
         @JvmStatic
-        fun isSpeechModelLoaded(): Boolean = cachedModel != null
+        fun isSpeechModelLoaded(context: Context): Boolean {
+            if (NetworkConnectivity.isLikelyOnline(context) &&
+                SpeechRecognizer.isRecognitionAvailable(context)
+            ) {
+                return true
+            }
+            return cachedVoskModel != null
+        }
+
+        @JvmStatic
+        fun isSpeechModelLoaded(): Boolean = cachedVoskModel != null || cachedWhisperContext != 0L
 
         private val speechModelReadyNotified = AtomicBoolean(false)
 
@@ -882,72 +1519,47 @@ class LocalVoiceRecognizer(
         }
     }
 
-    private fun ensureModelDir(): File {
+    private fun ensureWhisperModelFile(): File {
         if (loadCancelled) throw ModelSetupCancelled()
-        val baseDir = File(context.filesDir, "vosk")
-        if (!baseDir.exists()) baseDir.mkdirs()
-        val modelDir = File(baseDir, MODEL_DIR)
-        val zipFile = File(baseDir, "$MODEL_DIR.zip")
-
-        if (isVoskModelLayoutValid(modelDir)) {
-            return modelDir
+        val modelFile = WhisperModelFiles.modelFile(context)
+        modelFile.parentFile?.mkdirs()
+        if (modelFile.isFile && modelFile.length() >= WhisperModelFiles.MIN_MODEL_BYTES) {
+            return modelFile
         }
-        if (modelDir.exists()) {
-            Log.w(LOG_TAG, "vosk_model_dir_invalid_or_incomplete path=${modelDir.absolutePath} — removing and re-fetching")
-            modelDir.deleteRecursively()
-        }
-        if (zipFile.exists() && !isPlausibleCompleteModelZip(zipFile)) {
-            Log.w(LOG_TAG, "vosk_model_zip_incomplete_or_suspicious size=${zipFile.length()} — removing")
-            zipFile.delete()
+        if (modelFile.exists()) {
+            Log.w(LOG_TAG, "whisper_model_invalid size=${modelFile.length()} — removing")
+            modelFile.delete()
         }
 
         var lastError: Exception? = null
         repeat(2) { attempt ->
             try {
                 if (loadCancelled) throw ModelSetupCancelled()
-                downloadModelZip(zipFile)
+                downloadWhisperModelFile(modelFile)
                 if (loadCancelled) throw ModelSetupCancelled()
-                unzipModel(zipFile, baseDir)
-                if (isVoskModelLayoutValid(modelDir)) {
-                    return modelDir
+                if (modelFile.isFile && modelFile.length() >= WhisperModelFiles.MIN_MODEL_BYTES) {
+                    return modelFile
                 }
-                val candidates = baseDir.listFiles()?.filter { it.isDirectory && isVoskModelLayoutValid(it) } ?: emptyList()
-                if (candidates.isNotEmpty()) return candidates.first()
-                throw IllegalStateException("Model files missing after unzip")
+                throw IllegalStateException("Whisper model file missing or too small after download")
             } catch (e: ModelSetupCancelled) {
                 throw e
             } catch (e: Exception) {
                 lastError = e
-                Log.w(LOG_TAG, "vosk_model_setup_attempt_${attempt + 1} failed: ${e.message}", e)
-                purgeVoskModelArtifacts(baseDir, zipFile, modelDir)
+                Log.w(LOG_TAG, "whisper_model_setup_attempt_${attempt + 1} failed: ${e.message}", e)
+                try {
+                    modelFile.delete()
+                } catch (_: Exception) {
+                }
             }
         }
         throw IllegalStateException(
-            "Offline model setup failed (try clearing app storage or reinstall). Cause: ${lastError?.message}",
+            "Offline speech model setup failed (try clearing app storage or reinstall). Cause: ${lastError?.message}",
             lastError,
         )
     }
 
-    private fun purgeVoskModelArtifacts(baseDir: File, zipFile: File, modelDir: File) {
-        try {
-            zipFile.delete()
-            if (modelDir.exists()) modelDir.deleteRecursively()
-        } catch (e: Exception) {
-            Log.w(LOG_TAG, "vosk_model_purge_failed", e)
-        }
-    }
-
-    /** Vosk rejects folders that exist but lack am/conf (e.g. empty dir after failed download). */
-    private fun isVoskModelLayoutValid(dir: File): Boolean {
-        if (!dir.isDirectory) return false
-        return File(dir, "am").isDirectory && File(dir, "conf").isDirectory
-    }
-
-    /**
-     * The small English model zip is tens of MB. A 1–5 MB file is often a truncated download
-     * (bad network / process kill) and triggers "unexpected end of ZLIB input stream" on unzip.
-     */
-    private fun isPlausibleCompleteModelZip(zip: File): Boolean = zip.length() >= MIN_MODEL_ZIP_BYTES
+    private fun isPlausibleWhisperModelFile(f: File): Boolean =
+        f.isFile && f.length() >= WhisperModelFiles.MIN_MODEL_BYTES
 
     private fun shouldPostDownloadProgress(bytesRead: Long, totalBytes: Long): Boolean {
         if (bytesRead <= 0L) return false
@@ -956,10 +1568,10 @@ class LocalVoiceRecognizer(
         return delta >= 512 * 1024L
     }
 
-    private fun downloadModelZip(targetZip: File) {
-        if (targetZip.exists() && isPlausibleCompleteModelZip(targetZip)) return
+    private fun downloadWhisperModelFile(targetFile: File) {
+        if (targetFile.exists() && isPlausibleWhisperModelFile(targetFile)) return
         lastDownloadProgressPostBytes = 0L
-        val fromBundled = BundledVoiceModels.tryCopyBundledVoskZip(context, targetZip) { read, total ->
+        val fromBundled = BundledVoiceModels.tryCopyBundledWhisperGgml(context, targetFile) { read, total ->
             when {
                 read == 0L -> postModelSetupUi(VoiceModelSetupUiState.Downloading(0L, total))
                 shouldPostDownloadProgress(read, total) || (total > 0L && read >= total) -> {
@@ -969,13 +1581,13 @@ class LocalVoiceRecognizer(
             }
         }
         if (fromBundled) {
-            val len = targetZip.length()
+            val len = targetFile.length()
             postModelSetupUi(VoiceModelSetupUiState.Downloading(len, len))
             return
         }
-        val partFile = File(targetZip.parentFile, "${targetZip.name}.part")
+        val partFile = File(targetFile.parentFile, "${targetFile.name}.part")
         partFile.delete()
-        val connection = URL(MODEL_URL).openConnection() as HttpURLConnection
+        val connection = URL(WhisperModelFiles.MODEL_URL).openConnection() as HttpURLConnection
         connection.connectTimeout = 20000
         connection.readTimeout = 120_000
         connection.requestMethod = "GET"
@@ -1029,39 +1641,14 @@ class LocalVoiceRecognizer(
             else -> totalLen
         }
         postModelSetupUi(VoiceModelSetupUiState.Downloading(bytesRead, totalForUi))
-        if (!isPlausibleCompleteModelZip(partFile)) {
+        if (!isPlausibleWhisperModelFile(partFile)) {
             partFile.delete()
             throw IllegalStateException("Downloaded file too small (${partFile.length()} bytes); network may have dropped.")
         }
-        if (targetZip.exists()) targetZip.delete()
-        if (!partFile.renameTo(targetZip)) {
+        if (targetFile.exists()) targetFile.delete()
+        if (!partFile.renameTo(targetFile)) {
             partFile.delete()
-            throw IllegalStateException("Could not finalize model zip on disk")
-        }
-    }
-
-    private fun unzipModel(zipFile: File, targetDir: File) {
-        postModelSetupUi(VoiceModelSetupUiState.Unzipping)
-        try {
-            ZipInputStream(BufferedInputStream(zipFile.inputStream())).use { zis ->
-                var entry = zis.nextEntry
-                while (entry != null) {
-                    if (loadCancelled) throw ModelSetupCancelled()
-                    val outFile = File(targetDir, entry.name)
-                    if (entry.isDirectory) {
-                        outFile.mkdirs()
-                    } else {
-                        outFile.parentFile?.mkdirs()
-                        FileOutputStream(outFile).use { fos ->
-                            zis.copyTo(fos)
-                        }
-                    }
-                    zis.closeEntry()
-                    entry = zis.nextEntry
-                }
-            }
-        } catch (e: ZipException) {
-            throw IOException("Corrupt or incomplete zip (unexpected end of stream). Delete and re-download.", e)
+            throw IllegalStateException("Could not finalize Whisper model on disk")
         }
     }
 }

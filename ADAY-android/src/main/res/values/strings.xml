@@ -74,6 +74,9 @@
     <string name="voice_llm_settings_summary">Optional ~750 MB file (Q5) for smarter offline voice commands. Tap to download.</string>
     <string name="voice_local_listening">Listening offline...</string>
     <string name="voice_processing_command">Processing voice command…</string>
+    <string name="voice_status_whisper_transcribing">Transcribing speech (Whisper)…</string>
+    <string name="voice_status_llm_processing">Understanding command (AI)…</string>
+    <string name="voice_sr_not_available">Speech recognition is not available on this device.</string>
     <string name="voice_processing_channel">Voice command processing</string>
     <string name="voice_added_habit">Added habit: %1$s</string>
     <string name="voice_habit_not_found">Habit not found: %1$s</string>

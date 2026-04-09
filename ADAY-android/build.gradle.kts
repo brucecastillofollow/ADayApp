@@ -52,10 +52,30 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // One universal APK: real phones (armeabi-v7a / arm64-v8a) + x86_64 emulators (e.g. Pixel).
         // minSdk 28 covers Galaxy S9-class devices on Android 9+. Older OS versions are not supported.
-        // Optional: add "x86" if you still use a 32-bit AVD and your vosk/jna AARs ship x86 .so files.
-        // Android 15+ may log 16 KB ELF warnings for some prebuilt native libs; see docs/VOSK_16KB.md.
+        // Whisper.cpp JNI (libwhisper.so) via CMake; x86_64 for emulators.
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+        }
+        // Google Play 16 KB page-size requirement: NDK r28+ defaults; flag helps r27 CMake builds.
+        // https://developer.android.com/guide/practices/page-sizes
+        externalNativeBuild {
+            cmake {
+                arguments += listOf(
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                    // CMakeLists also forces GGML_OPENMP=OFF; duplicate ensures clean reconfigures.
+                    "-DGGML_OPENMP=OFF",
+                )
+            }
+        }
+    }
+
+    // r28+: 16 KB ELF alignment default for 64-bit; fixes libwhisper/libggml/libomp on 16 KB devices.
+    ndkVersion = "28.0.13004108"
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 
@@ -96,13 +116,11 @@ android {
 
     // Large models in assets: avoid deflate so AssetFileDescriptor.length is reliable and install I/O stays sane.
     androidResources {
-        noCompress += listOf("zip", "gguf")
+        noCompress += listOf("zip", "gguf", "bin")
     }
 }
 
 dependencies {
-    val localVoskAar = file("libs/vosk-android-16kb.aar")
-
     compileOnly(libs.jsr250.api)
     coreLibraryDesugaring(libs.desugar.jdk.libs)
     implementation(libs.appIntro)
@@ -122,18 +140,10 @@ dependencies {
     implementation(libs.material)
     implementation(libs.documentfile)
     implementation(libs.play.services.ads)
-    if (localVoskAar.exists()) {
-        implementation(files(localVoskAar))
-    } else {
-        implementation(libs.vosk.android)
-    }
-    // Vosk uses JNA; flat AAR does not pull transitive deps from Maven.
-    // Use the @aar artifact: the plain JAR has no com/sun/jna/android-*/libjnidispatch.so
-    // resources, which causes UnsatisfiedLinkError on device/emulator.
-    implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
     implementation(libs.opencsv)
     implementation(libs.konfetti.xml)
     implementation(libs.llama.kotlin.android)
+    implementation(libs.vosk.android)
     implementation(project(":aday-core"))
     ksp(libs.dagger.compiler)
 

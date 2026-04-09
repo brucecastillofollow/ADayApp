@@ -219,6 +219,19 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         localVoiceRecognizer.onPartialTranscript = { partial ->
             showLiveCaption(partial)
         }
+        localVoiceRecognizer.onProcessingStatus = { status ->
+            if (status == null) {
+                rootView.setVoiceStatus(null)
+                cancelPipelineNotification(VOICE_WHISPER_PROCESSING_NOTIFICATION_ID)
+            } else {
+                rootView.setVoiceStatus(status)
+                showOngoingPipelineNotification(
+                    VOICE_WHISPER_PROCESSING_NOTIFICATION_ID,
+                    status,
+                    getString(R.string.voice_status_whisper_transcribing),
+                )
+            }
+        }
         if (consumeOpenLlmDownloadIntent()) {
             mainHandler.post { startTinyLlamaDownloadFlow() }
         }
@@ -262,19 +275,19 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                     item,
                     android.content.res.ColorStateList.valueOf(Color.parseColor("#FFB74D")),
                 )
-                rootView.tbar.subtitle = getString(R.string.voice_preparing_mic)
+                rootView.setVoiceStatus(getString(R.string.voice_preparing_mic))
             }
             isVoiceRecording -> {
                 item.title = getString(R.string.voice_stop_recording)
                 item.setIcon(android.R.drawable.ic_media_pause)
                 MenuItemCompat.setIconTintList(item, android.content.res.ColorStateList.valueOf(Color.parseColor("#FF5252")))
-                rootView.tbar.subtitle = getString(R.string.voice_local_listening)
+                rootView.setVoiceStatus(getString(R.string.voice_local_listening))
             }
             else -> {
                 item.title = getString(R.string.voice_habit_command)
                 item.setIcon(android.R.drawable.ic_btn_speak_now)
                 MenuItemCompat.setIconTintList(item, null)
-                rootView.tbar.subtitle = null
+                rootView.setVoiceStatus(null)
             }
         }
     }
@@ -282,11 +295,11 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     private fun showLiveCaption(partial: String) {
         if (!isVoiceRecording) return
         val text = partial.trim()
-        rootView.tbar.subtitle = if (text.isBlank()) {
+        rootView.setVoiceStatus(if (text.isBlank()) {
             getString(R.string.voice_local_listening)
         } else {
             text
-        }
+        })
     }
 
     override fun onPause() {
@@ -614,6 +627,12 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             Toast.makeText(this, R.string.voice_not_recognized, Toast.LENGTH_SHORT).show()
             return
         }
+        rootView.setVoiceStatus(getString(R.string.voice_status_llm_processing))
+        showOngoingPipelineNotification(
+            VOICE_PROCESSING_NOTIFICATION_ID,
+            getString(R.string.voice_status_llm_processing),
+            trimmed.replace("\n", " ").trim().take(120),
+        )
         voiceOutcomeRunnable?.let { mainHandler.removeCallbacks(it) }
         val runnable = Runnable {
             voiceOutcomeRunnable = null
@@ -625,7 +644,25 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
 
     private fun showVoiceProcessingState(transcriptPreview: String) {
         if (isFinishing || isDestroyed) return
-        rootView.tbar.subtitle = getString(R.string.voice_processing_command)
+        rootView.setVoiceStatus(getString(R.string.voice_status_llm_processing))
+        val preview = transcriptPreview.replace("\n", " ").trim().take(120)
+            .ifBlank { getString(R.string.voice_not_recognized) }
+        showOngoingPipelineNotification(
+            VOICE_PROCESSING_NOTIFICATION_ID,
+            getString(R.string.voice_status_llm_processing),
+            preview,
+        )
+    }
+
+    private fun clearVoiceProcessingState() {
+        if (!isFinishing && !isDestroyed) {
+            rootView.setVoiceStatus(null)
+        }
+        cancelPipelineNotification(VOICE_PROCESSING_NOTIFICATION_ID)
+    }
+
+    private fun showOngoingPipelineNotification(notificationId: Int, title: String, body: String) {
+        if (isFinishing || isDestroyed) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(this, POST_NOTIFICATIONS) != PERMISSION_GRANTED
         ) {
@@ -641,26 +678,21 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                 ),
             )
         }
-        val preview = transcriptPreview.replace("\n", " ").trim().take(120)
-            .ifBlank { getString(R.string.voice_not_recognized) }
         val builder = NotificationCompat.Builder(this, VOICE_PROCESSING_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.voice_processing_command))
-            .setContentText(preview)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(preview))
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setProgress(0, 0, true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-        nm.notify(VOICE_PROCESSING_NOTIFICATION_ID, builder.build())
+        nm.notify(notificationId, builder.build())
     }
 
-    private fun clearVoiceProcessingState() {
-        if (!isFinishing && !isDestroyed) {
-            rootView.tbar.subtitle = null
-        }
+    private fun cancelPipelineNotification(notificationId: Int) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.cancel(VOICE_PROCESSING_NOTIFICATION_ID)
+        nm.cancel(notificationId)
     }
 
     /**
@@ -916,7 +948,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         val f = TinyLlamaModelFiles.modelFile(this)
         val llmDisk = TinyLlamaModelDownloader.isPlausibleModelFile(f)
         val llmRam = LocalLlamaRuntime.isLlamaWeightsInMemory()
-        val speechReady = LocalVoiceRecognizer.isSpeechModelLoaded()
+        val speechReady = LocalVoiceRecognizer.isSpeechModelLoaded(this)
         val speechLoading = localVoiceRecognizer.isModelLoadInProgress()
         val llmDownloading = llmDownloadDialog?.isShowing == true
         rootView.refreshModelStatusIndicators(
@@ -1021,6 +1053,8 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         private const val VOICE_PROCESSING_CHANNEL_ID = "voice_processing_v1"
         private const val VOICE_READY_NOTIFICATION_ID = 90420
         private const val VOICE_PROCESSING_NOTIFICATION_ID = 90423
+        /** Ongoing notification while Whisper transcribes after recording (distinct from LLM). */
+        private const val VOICE_WHISPER_PROCESSING_NOTIFICATION_ID = 90424
         private const val VOICE_READY_TIMEOUT_MS = 6000L
         /** Brief pause before command processing so UI can settle after recording stops. */
         private const val VOICE_OUTCOME_DELAY_MS = 200L

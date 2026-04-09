@@ -78,6 +78,13 @@ class ListHabitsRootView @Inject constructor(
     val listView: HabitCardListView = habitCardListViewFactory.create()
     val llEmpty = EmptyListView(context)
     val tbar = buildToolbar()
+    val voiceStatusBar = TextView(context).apply {
+        visibility = View.GONE
+        setTextColor(Color.WHITE)
+        setBackgroundColor(Color.parseColor("#263238"))
+        setPadding(dp(12f).toInt(), dp(6f).toInt(), dp(12f).toInt(), dp(6f).toInt())
+        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+    }
     val konfettiView = KonfettiView(context).apply {
         translationZ = 10f
     }
@@ -97,7 +104,8 @@ class ListHabitsRootView @Inject constructor(
             background = sres.getDrawable(R.attr.windowBackgroundColor)
             addAtTop(konfettiView)
             addAtTop(tbar)
-            addBelow(header, tbar)
+            addBelow(voiceStatusBar, tbar)
+            addBelow(header, voiceStatusBar)
             addBelow(listView, header, height = MATCH_PARENT)
             addBelow(llEmpty, header, height = MATCH_PARENT)
             addBelow(progressBar, header) {
@@ -261,6 +269,17 @@ class ListHabitsRootView @Inject constructor(
         speech.setBackgroundResource(spBg)
         speech.text = spLabel
         speech.contentDescription = resources.getString(spA11y)
+    }
+
+    fun setVoiceStatus(text: String?) {
+        val trimmed = text?.trim().orEmpty()
+        if (trimmed.isEmpty()) {
+            voiceStatusBar.text = ""
+            voiceStatusBar.visibility = View.GONE
+            return
+        }
+        voiceStatusBar.text = trimmed
+        voiceStatusBar.visibility = View.VISIBLE
     }
 
     private fun updateEmptyView() {
