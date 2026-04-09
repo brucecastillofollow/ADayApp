@@ -18,10 +18,19 @@ class LlmIntentJsonParserTest {
 
     @Test
     fun parseToCommand_markDone() {
-        val json = """{"intent":"mark_done","habitName":"Drink water"}"""
+        val json = """{"action":"mark_done","habit":"Drink water"}"""
         val cmd = LlmIntentJsonParser.parseToCommand(json, listOf("Drink water", "Run"))
         val done = cmd as? VoiceHabitCommand.MarkDone
         assertTrue(done != null)
         assertEquals("Drink water", done!!.habitName)
+    }
+
+    @Test
+    fun parseToCommand_deleteHabit() {
+        val json = """{"action":"delete_habit","habit":"Run"}"""
+        val cmd = LlmIntentJsonParser.parseToCommand(json, listOf("Drink water", "Run"))
+        val del = cmd as? VoiceHabitCommand.DeleteHabit
+        assertTrue(del != null)
+        assertEquals("Run", del!!.habitName)
     }
 }

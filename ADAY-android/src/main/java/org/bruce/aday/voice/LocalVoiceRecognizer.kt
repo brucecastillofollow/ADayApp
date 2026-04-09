@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.provider.MediaStore
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -19,21 +20,41 @@ import org.bruce.aday.R
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
+import kotlin.math.min
 import java.io.BufferedInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
+import java.io.RandomAccessFile
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
 
+/** Standard PCM WAV produced by [writeWavHeaderPlaceholder] (no extra chunks). */
+private const val WAV_HEADER_BYTES = 44
+
+private const val FINAL_RECOG_CHUNK_BYTES = 8192
+
+/** Backpressure for mic → disk / Vosk queues (each chunk is one [AudioRecord.read]). */
+private const val PCM_QUEUE_CAPACITY = 128
+
 /**
- * Offline Vosk recognition with [AudioRecord]: feeds [Recognizer.acceptWaveForm] and saves the same
- * PCM to a WAV file when the session ends (for debugging / review in logcat).
+ * End-of-stream marker for PCM queues. [ArrayBlockingQueue] does not permit `null` (see [ArrayBlockingQueue.offer]).
+ * Real capture never enqueues empty arrays (`nBytes == 0` is skipped), so [===] is unambiguous.
+ */
+private val PCM_STREAM_END = ByteArray(0)
+
+/**
+ * Offline Vosk with [AudioRecord]: one thread reads the mic and enqueues PCM copies; a writer thread
+ * appends to a WAV file; a recognizer thread feeds Vosk for live captions. On stop, the WAV is
+ * finalized and a **full-file** Vosk pass produces the transcript returned to the host.
  */
 class LocalVoiceRecognizer(
     private val context: Context,
@@ -49,6 +70,16 @@ class LocalVoiceRecognizer(
     private val mainHandler = Handler(Looper.getMainLooper())
     private var modelLoadThread: Thread? = null
     private var captureThread: Thread? = null
+    private var wavWriterThread: Thread? = null
+    private var liveRecognizerThread: Thread? = null
+
+    /** Set while the mic is open so [signalCaptureStop] can unblock [AudioRecord.read]. */
+    @Volatile
+    private var captureAudioRecord: AudioRecord? = null
+
+    /** Completed session WAV (app-private); used for final recognition and export after workers join. */
+    @Volatile
+    private var sessionWavFile: File? = null
 
     @Volatile
     private var lastTranscript: String = ""
@@ -155,6 +186,7 @@ class LocalVoiceRecognizer(
 
     fun stop() {
         loadCancelled = true
+        signalCaptureStop()
         modelLoadThread?.interrupt()
         Thread {
             shutdownVoiceThreadsAfterModelJoin(MODEL_LOAD_JOIN_SHORT_MS)
@@ -176,6 +208,7 @@ class LocalVoiceRecognizer(
             sessionFinishInProgress = true
         }
         loadCancelled = true
+        signalCaptureStop()
         modelLoadThread?.interrupt()
         Thread {
             try {
@@ -201,19 +234,72 @@ class LocalVoiceRecognizer(
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        joinCaptureThread(CAPTURE_JOIN_MS)
+        joinCapturePipeline(CAPTURE_JOIN_MS)
         modelLoadThread?.interrupt()
         modelLoadThread = null
         postListening(false)
     }
 
-    private fun joinCaptureThread(ms: Long) {
+    private fun signalCaptureStop() {
+        try {
+            captureAudioRecord?.stop()
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Joins mic capture, WAV writer, and live Vosk; then runs full-file recognition and export.
+     */
+    private fun joinCapturePipeline(ms: Long) {
         try {
             captureThread?.join(ms)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
         captureThread = null
+        try {
+            wavWriterThread?.join(ms)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        wavWriterThread = null
+        try {
+            liveRecognizerThread?.join(ms)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        liveRecognizerThread = null
+        finalizeSessionWavAndTranscript()
+    }
+
+    /**
+     * After the WAV file is closed by the writer thread, read PCM from disk and compute the final
+     * transcript (replaces streaming partials for [lastTranscript] returned to the host).
+     */
+    private fun finalizeSessionWavAndTranscript() {
+        val wav = sessionWavFile
+        val model = cachedModel
+        sessionWavFile = null
+        if (wav == null || model == null) {
+            return
+        }
+        if (!wav.isFile || wav.length() < WAV_HEADER_BYTES) {
+            Log.w(LOG_TAG, "voice_session_wav_missing_or_short path=${wav.absolutePath}")
+            return
+        }
+        try {
+            val wavBytes = wav.readBytes()
+            val pcm = readPcmPayloadFromWavBytes(wavBytes)
+            val text = runFinalRecognitionFromPcm(model, pcm)
+            lastTranscript = text
+            Log.i(
+                LOG_TAG,
+                "voice_final_from_file path=${wav.absolutePath} pcmBytes=${pcm.size} transcript=\"$text\"",
+            )
+            exportWavToPublicDownloads(context, wavBytes, wav.name)
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "voice_finalize_wav_failed", e)
+        }
     }
 
     private fun postListening(listening: Boolean) {
@@ -330,13 +416,104 @@ class LocalVoiceRecognizer(
             notifySpeechModelReady()
         }
         if (loadCancelled) return
-        captureThread = Thread {
-            var audioRecord: AudioRecord? = null
-            var recognizer: Recognizer? = null
-            var pcmOut: FileOutputStream? = null
-            val pcmTemp = File(context.cacheDir, "voice_session_${System.currentTimeMillis()}.pcm")
-            var pcmBytes = 0
+
+        val musicRoot = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir
+        val wavDir = File(musicRoot, "ADay/voice")
+        if (!wavDir.exists() && !wavDir.mkdirs()) {
+            mainHandler.post { onError("Could not create voice recording folder") }
+            return
+        }
+        val wavFile = File(wavDir, "voice_${System.currentTimeMillis()}.wav")
+        try {
+            RandomAccessFile(wavFile, "rw").use { raf ->
+                writeWavHeaderPlaceholder(raf)
+            }
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "voice_wav_create_failed", e)
+            mainHandler.post { onError("Could not create voice recording file") }
+            return
+        }
+        sessionWavFile = wavFile
+
+        val writerQueue = ArrayBlockingQueue<ByteArray>(PCM_QUEUE_CAPACITY)
+        val recognizerQueue = ArrayBlockingQueue<ByteArray>(PCM_QUEUE_CAPACITY)
+
+        wavWriterThread = Thread {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+            var raf: RandomAccessFile? = null
+            try {
+                raf = RandomAccessFile(wavFile, "rw")
+                var totalPcm = 0L
+                while (true) {
+                    val chunk = writerQueue.take()
+                    if (chunk === PCM_STREAM_END) break
+                    raf.seek(raf.length())
+                    raf.write(chunk)
+                    totalPcm += chunk.size
+                }
+                patchWavHeader(raf, totalPcm)
+                Log.i(
+                    LOG_TAG,
+                    "voice_wav_writer_done path=${wavFile.absolutePath} pcmBytes=$totalPcm",
+                )
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "voice_wav_writer_failed", e)
+            } finally {
+                try {
+                    raf?.close()
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        liveRecognizerThread = Thread {
+            val recognizer = Recognizer(model, SAMPLE_RATE)
             var lastPartialPosted = ""
+            val finalizedSegments = mutableListOf<String>()
+            try {
+                while (true) {
+                    val chunk = recognizerQueue.take()
+                    if (chunk === PCM_STREAM_END) break
+                    val accepted = recognizer.acceptWaveForm(chunk, chunk.size)
+                    val partialText = parseHypothesis(recognizer.partialResult)
+                    val liveCaption = joinFinalizedAndPartial(finalizedSegments, partialText)
+                    if (liveCaption.isNotEmpty()) {
+                        lastTranscript = liveCaption
+                        if (liveCaption != lastPartialPosted) {
+                            lastPartialPosted = liveCaption
+                            mainHandler.post { onPartialTranscript?.invoke(liveCaption) }
+                        }
+                    }
+                    if (accepted) {
+                        parseHypothesis(recognizer.result)?.let { segment ->
+                            val s = segment.trim()
+                            if (s.isNotEmpty()) {
+                                finalizedSegments.add(s)
+                                val committed = joinFinalizedAndPartial(finalizedSegments, null)
+                                lastTranscript = committed
+                                if (committed != lastPartialPosted) {
+                                    lastPartialPosted = committed
+                                    mainHandler.post { onPartialTranscript?.invoke(committed) }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                if (!loadCancelled) {
+                    Log.e(LOG_TAG, "voice_live_recognizer_failed", e)
+                }
+            } finally {
+                try {
+                    recognizer.close()
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        captureThread = Thread {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+            var audioRecord: AudioRecord? = null
             try {
                 if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
                     PackageManager.PERMISSION_GRANTED
@@ -355,62 +532,40 @@ class LocalVoiceRecognizer(
                     mainHandler.post { onError("Microphone buffer size invalid") }
                     return@Thread
                 }
-                // PCM 16-bit mono: frame size is 2 bytes; buffer must be a multiple of that for reads.
-                var bufferSizeBytes = minBuf * 2
+                val hundredMsBytes = SAMPLE_RATE_HZ * 2 * 100 / 1000
+                var bufferSizeBytes = maxOf(minBuf * 4, hundredMsBytes)
                 if (bufferSizeBytes % 2 != 0) bufferSizeBytes++
-                val shortBuf = ShortArray(bufferSizeBytes / 2)
                 val byteBuf = ByteArray(bufferSizeBytes)
-                recognizer = Recognizer(model, SAMPLE_RATE)
                 audioRecord = openAudioRecordOrNull(bufferSizeBytes)
                 if (audioRecord == null || audioRecord.state != AudioRecord.STATE_INITIALIZED) {
                     audioRecord?.release()
                     mainHandler.post { onError("Microphone not available") }
                     return@Thread
                 }
-                pcmOut = FileOutputStream(pcmTemp)
+                captureAudioRecord = audioRecord
                 audioRecord.startRecording()
-                // Avoid reading before the HAL is actually capturing (first buffers can be silent).
                 var waitMs = 0
                 while (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING && waitMs < 500) {
                     Thread.sleep(5)
                     waitMs += 5
                 }
                 postListening(true)
+                var liveCaptionDropLogged = false
                 while (!loadCancelled) {
-                    val nShorts = audioRecord.read(shortBuf, 0, shortBuf.size)
-                    if (nShorts < 0) break
-                    if (nShorts == 0) continue
-                    val nBytes = nShorts * 2
-                    var o = 0
-                    for (i in 0 until nShorts) {
-                        val s = shortBuf[i].toInt()
-                        byteBuf[o++] = (s and 0xff).toByte()
-                        byteBuf[o++] = ((s shr 8) and 0xff).toByte()
-                    }
-                    pcmOut.write(byteBuf, 0, nBytes)
-                    pcmBytes += nBytes
-                    val accepted = recognizer.acceptWaveForm(byteBuf, nBytes)
-                    parseHypothesis(recognizer.partialResult)?.let { text ->
-                        lastTranscript = text
-                        if (text != lastPartialPosted) {
-                            lastPartialPosted = text
-                            mainHandler.post { onPartialTranscript?.invoke(text) }
+                    val nBytes = audioRecord.read(byteBuf, 0, byteBuf.size)
+                    if (nBytes < 0) break
+                    if (nBytes == 0) continue
+                    val w = byteBuf.copyOfRange(0, nBytes)
+                    val r = w.copyOf()
+                    writerQueue.put(w)
+                    if (!recognizerQueue.offer(r, 300, TimeUnit.MILLISECONDS)) {
+                        if (!liveCaptionDropLogged) {
+                            liveCaptionDropLogged = true
+                            Log.w(
+                                LOG_TAG,
+                                "live_recognizer_queue_full — dropping preview chunks only; WAV still records",
+                            )
                         }
-                    }
-                    if (accepted) {
-                        parseHypothesis(recognizer.result)?.let { text ->
-                            lastTranscript = text
-                            if (text != lastPartialPosted) {
-                                lastPartialPosted = text
-                                mainHandler.post { onPartialTranscript?.invoke(text) }
-                            }
-                        }
-                    }
-                }
-                parseHypothesis(recognizer.finalResult)?.let { text ->
-                    lastTranscript = text
-                    if (text != lastPartialPosted) {
-                        mainHandler.post { onPartialTranscript?.invoke(text) }
                     }
                 }
             } catch (e: Exception) {
@@ -423,50 +578,100 @@ class LocalVoiceRecognizer(
                     audioRecord?.stop()
                 } catch (_: Exception) {
                 }
+                captureAudioRecord = null
                 audioRecord?.release()
-                try {
-                    pcmOut?.flush()
-                    pcmOut?.close()
-                } catch (_: Exception) {
-                }
-                recognizer?.close()
-                if (pcmBytes > 0 && pcmTemp.exists()) {
-                    val pcmData = pcmTemp.readBytes()
-                    val musicRoot = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
-                        ?: context.filesDir
-                    val wavDir = File(musicRoot, "ADay/voice")
-                    if (!wavDir.exists()) wavDir.mkdirs()
-                    val wavName = "voice_${System.currentTimeMillis()}.wav"
-                    val wavFile = File(wavDir, wavName)
-                    try {
-                        writePcmFileAsWav(pcmData, wavFile)
-                        Log.i(
-                            LOG_TAG,
-                            "voice_recording_saved app_private_path=${wavFile.absolutePath} " +
-                                "wavBytes=${wavFile.length()} pcmBytes=$pcmBytes transcript=\"$lastTranscript\"",
-                        )
-                        exportWavToPublicDownloads(context, pcmData, wavName)
-                    } catch (e: Exception) {
-                        Log.e(LOG_TAG, "voice_recording_wav_failed", e)
-                    }
-                } else {
-                    Log.w(LOG_TAG, "voice_recording_no_pcm pcmBytes=$pcmBytes tempExists=${pcmTemp.exists()}")
-                }
-                if (pcmTemp.exists()) pcmTemp.delete()
+                offerPoisonOrDropOldest(writerQueue)
+                offerPoisonOrDropOldest(recognizerQueue)
             }
-        }.also { it.start() }
+        }
+
+        wavWriterThread!!.start()
+        liveRecognizerThread!!.start()
+        captureThread!!.start()
+    }
+
+    private fun writeWavHeaderPlaceholder(raf: RandomAccessFile) {
+        raf.seek(0)
+        raf.write("RIFF".toByteArray(StandardCharsets.US_ASCII))
+        writeLe32Raf(raf, 36)
+        raf.write("WAVE".toByteArray(StandardCharsets.US_ASCII))
+        raf.write("fmt ".toByteArray(StandardCharsets.US_ASCII))
+        writeLe32Raf(raf, 16)
+        writeLe16Raf(raf, 1)
+        writeLe16Raf(raf, 1)
+        writeLe32Raf(raf, SAMPLE_RATE_HZ)
+        writeLe32Raf(raf, SAMPLE_RATE_HZ * 2)
+        writeLe16Raf(raf, 2)
+        writeLe16Raf(raf, 16)
+        raf.write("data".toByteArray(StandardCharsets.US_ASCII))
+        writeLe32Raf(raf, 0)
+    }
+
+    private fun patchWavHeader(raf: RandomAccessFile, pcmByteCount: Long) {
+        val pcmSize = pcmByteCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        val riffChunkSize = 36 + pcmSize
+        raf.seek(4)
+        writeLe32Raf(raf, riffChunkSize)
+        raf.seek(40)
+        writeLe32Raf(raf, pcmSize)
+    }
+
+    private fun writeLe16Raf(raf: RandomAccessFile, v: Int) {
+        raf.write(v and 0xff)
+        raf.write((v shr 8) and 0xff)
+    }
+
+    private fun writeLe32Raf(raf: RandomAccessFile, v: Int) {
+        raf.write(v and 0xff)
+        raf.write((v shr 8) and 0xff)
+        raf.write((v shr 16) and 0xff)
+        raf.write((v shr 24) and 0xff)
+    }
+
+    private fun readPcmPayloadFromWavBytes(wavBytes: ByteArray): ByteArray {
+        if (wavBytes.size <= WAV_HEADER_BYTES) return ByteArray(0)
+        return wavBytes.copyOfRange(WAV_HEADER_BYTES, wavBytes.size)
+    }
+
+    /** Ensures a poison slot exists even if a queue is full (e.g. stuck consumer). */
+    private fun offerPoisonOrDropOldest(q: ArrayBlockingQueue<ByteArray>) {
+        while (!q.offer(PCM_STREAM_END, 2, TimeUnit.SECONDS)) {
+            q.poll()
+            Log.w(LOG_TAG, "queue_drop_oldest_for_poison")
+        }
+    }
+
+    private fun runFinalRecognitionFromPcm(model: Model, pcm: ByteArray): String {
+        if (pcm.isEmpty()) return ""
+        val recognizer = Recognizer(model, SAMPLE_RATE)
+        try {
+            var offset = 0
+            while (offset < pcm.size) {
+                val n = min(FINAL_RECOG_CHUNK_BYTES, pcm.size - offset)
+                val slice = pcm.copyOfRange(offset, offset + n)
+                recognizer.acceptWaveForm(slice, slice.size)
+                offset += n
+            }
+            val json = recognizer.finalResult
+            return parseHypothesis(json)?.trim().orEmpty()
+        } finally {
+            try {
+                recognizer.close()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     /**
      * Puts a copy under **Download/ADay/voice** (internal folder name is [Environment.DIRECTORY_DOWNLOADS]
-     * = `Download`, which Samsung shows as Downloads).
+     * = `Download`, which Samsung shows as Downloads). [wavFileBytes] is a full `.wav` (header + PCM).
      *
      * - **API 29+**: [MediaStore] (Downloads first; some OEMs need [MediaStore.Audio] fallback).
      * - **API 28**: direct file write + [MediaScannerConnection] (needs [Manifest.permission.WRITE_EXTERNAL_STORAGE]).
      */
-    private fun exportWavToPublicDownloads(appContext: Context, pcm: ByteArray, fileName: String) {
+    private fun exportWavToPublicDownloads(appContext: Context, wavFileBytes: ByteArray, fileName: String) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            exportWavLegacyPublicDownload(appContext, pcm, fileName)
+            exportWavLegacyPublicDownload(appContext, wavFileBytes, fileName)
             return
         }
         val resolver = appContext.contentResolver
@@ -498,7 +703,7 @@ class LocalVoiceRecognizer(
         }
         try {
             resolver.openOutputStream(uri)?.use { out ->
-                writePcmAsWavToStream(pcm, out)
+                out.write(wavFileBytes)
             } ?: run {
                 Log.w(LOG_TAG, "voice_wav_open_stream_failed")
                 resolver.delete(uri, null, null)
@@ -522,7 +727,7 @@ class LocalVoiceRecognizer(
         }
     }
 
-    private fun exportWavLegacyPublicDownload(appContext: Context, pcm: ByteArray, fileName: String) {
+    private fun exportWavLegacyPublicDownload(appContext: Context, wavFileBytes: ByteArray, fileName: String) {
         if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -543,7 +748,7 @@ class LocalVoiceRecognizer(
         }
         val file = File(dir, fileName)
         try {
-            writePcmFileAsWav(pcm, file)
+            file.writeBytes(wavFileBytes)
             MediaScannerConnection.scanFile(
                 appContext,
                 arrayOf(file.absolutePath),
@@ -568,10 +773,36 @@ class LocalVoiceRecognizer(
         }
     }
 
+    /**
+     * Vosk commits speech in **segments** (each [Recognizer.acceptWaveForm] true = one segment).
+     * Partials only cover the **current** segment, so we must join all segments for the full phrase.
+     */
+    private fun joinFinalizedAndPartial(segments: List<String>, partial: String?): String {
+        val base = segments.map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" ").trim()
+        val p = partial?.trim().orEmpty()
+        return when {
+            p.isEmpty() -> base
+            base.isEmpty() -> p
+            else -> "$base $p"
+        }
+    }
+
+    /** Appends [finalResult] tail (last unfinished utterance) without duplicating the last segment. */
+    private fun mergeFinalTail(segments: List<String>, tail: String?): String {
+        val base = segments.map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" ").trim()
+        val t = tail?.trim() ?: return base
+        if (t.isEmpty()) return base
+        if (base.isEmpty()) return t
+        if (base.endsWith(t, ignoreCase = true)) return base
+        val last = segments.lastOrNull()?.trim()
+        if (last != null && last.equals(t, ignoreCase = true)) return base
+        return "$base $t".trim()
+    }
+
     companion object {
         private const val LOG_TAG = "ADayVoice"
-        private const val MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
-        private const val MODEL_DIR = "vosk-model-small-en-us-0.15"
+        private const val MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip"
+        private const val MODEL_DIR = "vosk-model-en-us-0.22-lgraph"
         private const val SAMPLE_RATE = 16000.0f
         private const val SAMPLE_RATE_HZ = 16000
         private const val SESSION_COMPLETE_DELAY_MS = 350L
@@ -580,9 +811,13 @@ class LocalVoiceRecognizer(
         private const val MODEL_LOAD_JOIN_MS = 120_000L
         /** [stop] from [onStop] should not block long if model is still downloading. */
         private const val MODEL_LOAD_JOIN_SHORT_MS = 3_000L
-        /** vosk-model-small-en-us-0.15.zip is ~40MB; smaller files are usually truncated downloads. */
-        private const val MIN_MODEL_ZIP_BYTES = 25_000_000L
+        /** vosk-model-en-us-0.22-lgraph.zip is ~128MB; smaller files are usually truncated downloads. */
+        private const val MIN_MODEL_ZIP_BYTES = 90_000_000L
         private var cachedModel: Model? = null
+
+        /** True after the offline Vosk model is unpacked and loaded in memory. */
+        @JvmStatic
+        fun isSpeechModelLoaded(): Boolean = cachedModel != null
 
         private val speechModelReadyNotified = AtomicBoolean(false)
 

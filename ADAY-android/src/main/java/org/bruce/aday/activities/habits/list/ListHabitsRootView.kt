@@ -20,7 +20,15 @@
 package org.bruce.aday.activities.habits.list
 
 import android.content.Context
+import android.graphics.Color
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.Toolbar
 import android.widget.FrameLayout
 import android.widget.RelativeLayout
 import nl.dionsegijn.konfetti.xml.KonfettiView
@@ -77,6 +85,9 @@ class ListHabitsRootView @Inject constructor(
     val hintView: HintView
     val header = HeaderView(context, preferences, midnightTimer)
 
+    private var llmStatusChip: TextView? = null
+    private var speechStatusChip: TextView? = null
+
     init {
         val hints = resources.getStringArray(R.array.hints)
         val hintList = hintListFactory.create(hints)
@@ -101,6 +112,7 @@ class ListHabitsRootView @Inject constructor(
             displayHomeAsUpEnabled = false,
             theme = currentTheme()
         )
+        installHabitsToolbarTitleRow()
         addView(rootView, MATCH_PARENT, MATCH_PARENT)
         listAdapter.setListView(listView)
     }
@@ -144,6 +156,111 @@ class ListHabitsRootView @Inject constructor(
         val labelWidth = max((measuredWidth / 3).toFloat(), nameWidth)
         val buttonCount = ((measuredWidth - labelWidth) / buttonWidth).toInt()
         return min(MAX_CHECKMARK_COUNT, max(0, buttonCount))
+    }
+
+    private fun installHabitsToolbarTitleRow() {
+        val act = context as AppCompatActivity
+        act.supportActionBar?.setDisplayShowTitleEnabled(false)
+        tbar.title = ""
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val titleTv = TextView(context).apply {
+            text = resources.getString(R.string.main_activity_title)
+            setTextAppearance(context, androidx.appcompat.R.style.TextAppearance_AppCompat_Widget_ActionBar_Title)
+        }
+        row.addView(titleTv, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        row.addView(
+            View(context).apply { layoutParams = LinearLayout.LayoutParams(dp(8f).toInt(), 1) },
+        )
+        val llm = TextView(context).apply {
+            text = "LLM"
+            applyToolbarStatusChipStyle()
+        }
+        val speech = TextView(context).apply {
+            text = "Speech"
+            applyToolbarStatusChipStyle()
+        }
+        llmStatusChip = llm
+        speechStatusChip = speech
+        row.addView(llm, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        row.addView(
+            View(context).apply { layoutParams = LinearLayout.LayoutParams(dp(6f).toInt(), 1) },
+        )
+        row.addView(speech, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        tbar.addView(
+            row,
+            Toolbar.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.START or Gravity.CENTER_VERTICAL),
+        )
+    }
+
+    private fun TextView.applyToolbarStatusChipStyle() {
+        setTextColor(Color.WHITE)
+        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+        val pxH = dp(5f).toInt()
+        val pxW = dp(7f).toInt()
+        setPadding(pxW, pxH, pxW, pxH)
+    }
+
+    /**
+     * Updates the LLM / Speech chips next to the Habits title. Call from the activity on resume and
+     * whenever download or model load state changes.
+     */
+    fun refreshModelStatusIndicators(
+        llmInMemory: Boolean,
+        llmDownloading: Boolean,
+        llmFileOnDisk: Boolean,
+        speechReady: Boolean,
+        speechLoading: Boolean,
+    ) {
+        val llm = llmStatusChip ?: return
+        val speech = speechStatusChip ?: return
+        val (llmBg, llmA11y, llmLabel) = when {
+            llmInMemory -> Triple(
+                R.drawable.toolbar_status_chip_ready,
+                R.string.toolbar_status_llm_ready,
+                "LLM",
+            )
+            llmDownloading -> Triple(
+                R.drawable.toolbar_status_chip_pending,
+                R.string.toolbar_status_llm_downloading,
+                "LLM",
+            )
+            llmFileOnDisk -> Triple(
+                R.drawable.toolbar_status_chip_pending,
+                R.string.toolbar_status_llm_on_disk,
+                "LLM",
+            )
+            else -> Triple(
+                R.drawable.toolbar_status_chip_off,
+                R.string.toolbar_status_llm_missing,
+                "LLM",
+            )
+        }
+        llm.setBackgroundResource(llmBg)
+        llm.text = llmLabel
+        llm.contentDescription = resources.getString(llmA11y)
+        val (spBg, spA11y, spLabel) = when {
+            speechReady -> Triple(
+                R.drawable.toolbar_status_chip_ready,
+                R.string.toolbar_status_speech_ready,
+                "Speech",
+            )
+            speechLoading -> Triple(
+                R.drawable.toolbar_status_chip_pending,
+                R.string.toolbar_status_speech_loading,
+                "Speech",
+            )
+            else -> Triple(
+                R.drawable.toolbar_status_chip_off,
+                R.string.toolbar_status_speech_missing,
+                "Speech",
+            )
+        }
+        speech.setBackgroundResource(spBg)
+        speech.text = spLabel
+        speech.contentDescription = resources.getString(spA11y)
     }
 
     private fun updateEmptyView() {

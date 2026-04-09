@@ -10,7 +10,7 @@ import java.io.FileOutputStream
  * Optional models shipped inside the APK under `assets/bundled/` so first launch avoids network.
  *
  * Place files (see `assets/bundled/**/README.txt`):
- * - `bundled/vosk/vosk-model-small-en-us-0.15.zip` (~40MB)
+ * - `bundled/vosk/vosk-model-en-us-0.22-lgraph.zip` (~128MB; 0.22-class accuracy, mobile-friendly)
  * - `bundled/llm/tinyllama-1.1b-chat-v1.0.Q5_K_M.gguf` (~750MB)
  *
  * If an asset is missing, existing HTTP download paths still run.
@@ -20,7 +20,10 @@ object BundledVoiceModels {
     private const val TAG = "ADayBundledModels"
 
     /** Same basename as [LocalVoiceRecognizer] zip on disk. */
-    private const val ASSET_VOSK_ZIP = "bundled/vosk/vosk-model-small-en-us-0.15.zip"
+    private const val ASSET_VOSK_ZIP = "bundled/vosk/vosk-model-en-us-0.22-lgraph.zip"
+
+    /** Aligned with [LocalVoiceRecognizer] min zip size (~128MB; reject truncated copies). */
+    private const val MIN_VOSK_ZIP_BYTES = 90_000_000L
 
     private const val ASSET_LLM_GGUF = "bundled/llm/${TinyLlamaModelFiles.MODEL_FILENAME}"
 
@@ -54,7 +57,7 @@ object BundledVoiceModels {
                     }
                 }
             }
-            if (part.length() < 25_000_000L) {
+            if (part.length() < MIN_VOSK_ZIP_BYTES) {
                 part.delete()
                 Log.w(TAG, "bundled vosk zip too small (${part.length()} bytes)")
                 return false

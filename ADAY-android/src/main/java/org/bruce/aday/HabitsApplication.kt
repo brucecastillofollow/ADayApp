@@ -31,6 +31,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat.checkSelfPermission
 import com.google.android.gms.ads.MobileAds
+import org.bruce.aday.ads.AdsEnvironment
 import org.bruce.aday.ads.RewardedAdManager
 import org.bruce.aday.core.database.UnsupportedDatabaseVersionException
 import org.bruce.aday.core.reminders.ReminderScheduler
@@ -107,9 +108,6 @@ class HabitsApplication : Application() {
             setStartDayOffset(0, 0)
         }
 
-        val habitList = component.habitList
-        for (h in habitList) h.recompute()
-
         widgetUpdater = component.widgetUpdater.apply {
             startListening()
             scheduleStartDayWidgetUpdate()
@@ -122,9 +120,26 @@ class HabitsApplication : Application() {
         notificationTray.startListening()
 
         val taskRunner = component.taskRunner
-        taskRunner.execute {
-            reminderScheduler.scheduleAll()
-            widgetUpdater.updateWidgets()
+        if (isTestMode()) {
+            for (h in component.habitList) h.recompute()
+            taskRunner.execute {
+                reminderScheduler.scheduleAll()
+                widgetUpdater.updateWidgets()
+            }
+        } else {
+            // Defer heavy per-habit work until the main looper is idle so the first frame is not blocked.
+            Looper.getMainLooper().queue.addIdleHandler {
+                try {
+                    for (h in component.habitList) h.recompute()
+                } catch (e: Exception) {
+                    Log.w("HabitsApplication", "idle habit recompute failed", e)
+                }
+                taskRunner.execute {
+                    reminderScheduler.scheduleAll()
+                    widgetUpdater.updateWidgets()
+                }
+                false
+            }
         }
 
         if (!isTestMode()) {
@@ -137,9 +152,7 @@ class HabitsApplication : Application() {
     }
 
     private fun startDeferredAdsAndOfflineModels() {
-        MobileAds.initialize(this) {}
-        RewardedAdManager.preload(this)
-
+        // Voice + Vosk first; Mobile Ads pulls GMS/Dynamite and can overlap mic work or GMS updates.
         LocalLlamaRuntime.install()
         voiceModelPrefetch = LocalVoiceRecognizer(
             applicationContext,
@@ -148,11 +161,25 @@ class HabitsApplication : Application() {
         )
         voiceModelPrefetch?.prefetchModelIfNeeded()
 
+        if (AdsEnvironment.shouldInitializeMobileAds()) {
+            applicationScope.launch(Dispatchers.Main) {
+                delay(10_000)
+                try {
+                    MobileAds.initialize(this@HabitsApplication) {}
+                    RewardedAdManager.preload(this@HabitsApplication)
+                } catch (e: Exception) {
+                    Log.w("ADayAds", "Mobile Ads init failed", e)
+                }
+            }
+        } else {
+            Log.i("ADayAds", "Skipping Mobile Ads (emulator / unsupported environment)")
+        }
+
         applicationScope.launch(Dispatchers.IO) {
             try {
                 // Stagger vs Vosk asset copy + unzip so first frame / DB / launcher transition are not
                 // competing with a ~750MB GGUF read+write on the same storage queue.
-                delay(2_000)
+                delay(6_000)
                 val f = TinyLlamaModelFiles.modelFile(applicationContext)
                 if (!TinyLlamaModelDownloader.isPlausibleModelFile(f)) {
                     postLlmStartupNotification("Preparing offline AI model...", null)

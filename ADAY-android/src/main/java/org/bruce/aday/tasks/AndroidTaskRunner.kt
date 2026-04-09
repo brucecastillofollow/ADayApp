@@ -4,8 +4,8 @@
  * This file is part of ADay.
  *
  * ADay is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by the
- * Free Software Foundation, either version 3 of the License, or (at your
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your
  * option) any later version.
  *
  * ADay is distributed in the hope that it will be useful, but
@@ -18,76 +18,78 @@
  */
 package org.bruce.aday.tasks
 
-import android.os.AsyncTask
+import android.os.Handler
+import android.os.Looper
 import dagger.Module
 import dagger.Provides
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import org.bruce.aday.core.AppScope
 import org.bruce.aday.core.tasks.Task
 import org.bruce.aday.core.tasks.TaskRunner
-import java.util.HashMap
-import java.util.LinkedList
 
-// TODO: @Module not needed?
+/**
+ * Replaces deprecated [android.os.AsyncTask] with a single background thread (matching the
+ * historical SERIAL executor behavior) and main-thread pre/post/progress.
+ */
 @Module
 class AndroidTaskRunner : TaskRunner {
-    private val activeTasks: LinkedList<CustomAsyncTask> = LinkedList()
-    private val taskToAsyncTask: HashMap<Task, CustomAsyncTask> = HashMap()
-    private val listeners: LinkedList<TaskRunner.Listener> = LinkedList<TaskRunner.Listener>()
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val backgroundExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "aday-task").apply {
+            isDaemon = true
+        }
+    }
+    private val activeCount = AtomicInteger(0)
+    private val listeners = CopyOnWriteArrayList<TaskRunner.Listener>()
+
     override fun addListener(listener: TaskRunner.Listener) {
         listeners.add(listener)
-    }
-
-    override fun execute(task: Task) {
-        task.onAttached(this)
-        CustomAsyncTask(task).execute()
-    }
-
-    override val activeTaskCount: Int
-        get() = activeTasks.size
-
-    override fun publishProgress(task: Task, progress: Int) {
-        val asyncTask = taskToAsyncTask[task] ?: return
-        asyncTask.publish(progress)
     }
 
     override fun removeListener(listener: TaskRunner.Listener) {
         listeners.remove(listener)
     }
 
-    private inner class CustomAsyncTask(val task: Task) : AsyncTask<Void?, Int?, Void?>() {
-
-        fun publish(progress: Int) {
-            publishProgress(progress)
-        }
-
-        @Deprecated("Deprecated in Java")
-        override fun doInBackground(vararg params: Void?): Void? {
-            if (isCancelled) return null
-            task.doInBackground()
-            return null
-        }
-
-        @Deprecated("Deprecated in Java")
-        override fun onPostExecute(aVoid: Void?) {
-            if (isCancelled) return
-            task.onPostExecute()
-            activeTasks.remove(this)
-            taskToAsyncTask.remove(task)
-            for (l in listeners) l.onTaskFinished(task)
-        }
-
-        @Deprecated("Deprecated in Java")
-        override fun onPreExecute() {
-            if (isCancelled) return
-            for (l in listeners) l.onTaskStarted(task)
-            activeTasks.add(this)
-            taskToAsyncTask[task] = this
+    override fun execute(task: Task) {
+        task.onAttached(this)
+        mainHandler.post {
+            for (l in listeners) {
+                l.onTaskStarted(task)
+            }
+            activeCount.incrementAndGet()
             task.onPreExecute()
+            backgroundExecutor.execute {
+                try {
+                    if (!task.isCanceled()) {
+                        task.doInBackground()
+                    }
+                } finally {
+                    mainHandler.post {
+                        try {
+                            if (!task.isCanceled()) {
+                                task.onPostExecute()
+                            }
+                        } finally {
+                            activeCount.decrementAndGet()
+                            for (l in listeners) {
+                                l.onTaskFinished(task)
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
 
-        @Deprecated("Deprecated in Java")
-        override fun onProgressUpdate(vararg values: Int?) {
-            values[0]?.let { task.onProgressUpdate(it) }
+    override val activeTaskCount: Int
+        get() = activeCount.get()
+
+    override fun publishProgress(task: Task, progress: Int) {
+        mainHandler.post {
+            task.onProgressUpdate(progress)
         }
     }
 

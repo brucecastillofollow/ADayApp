@@ -9,10 +9,7 @@ import org.bruce.aday.voice.VoiceHabitCommand
  * If the GGUF is missing or native libs are unavailable (e.g. some 32-bit devices), [tryInterpretWithLlm]
  * returns null and the pipeline uses rules + heuristics only.
  *
- * @param modelPath Absolute path to the `.gguf` file ([TinyLlamaModelFiles.modelFile]).
- * @param system First block (instructions).
- * @param user Second block (user transcript).
- * @return Raw model text (should be JSON per [VoiceLlmPrompts]).
+ * Inference runs on a dedicated thread inside [LocalLlamaRuntime]; call from a coroutine.
  */
 object LlamaInference {
 
@@ -25,21 +22,22 @@ object LlamaInference {
         val parsedSummary: String,
     )
 
-    /**
-     * Set from your JNI / llama.cpp entrypoint after loading the native library.
-     * Call from a background thread only; generation can take seconds.
-     */
-    @Volatile
-    var generateBlocking: ((modelPath: String, system: String, user: String) -> String?)? = null
     @Volatile private var lastTranscript: String = ""
     @Volatile private var lastRawOutput: String = ""
-    @Volatile private var lastParsedSummary: String = "none"
+    @Volatile private var lastParsedSummary: String = INITIAL_SUMMARY
 
-    fun tryInterpretWithLlm(context: Context, transcript: String, habitNames: List<String>): VoiceHabitCommand? {
-        val gen = generateBlocking ?: run {
-            setDebug(transcript, "", "skipped:no_generator")
-            return null
-        }
+    /** Shown until this session updates the snapshot (avoids misleading "none" in the debug dialog). */
+    private const val INITIAL_SUMMARY = "not_invoked_yet"
+
+    /**
+     * Call when [VoiceIntentPipeline] matched via rules/heuristics so [debugSnapshot] does not stay
+     * at the initial placeholder — the LLM was intentionally not run.
+     */
+    fun noteLlmNotInvoked(transcript: String, stage: String) {
+        setDebug(transcript, "", "skipped:llm_not_needed_$stage")
+    }
+
+    suspend fun tryInterpretWithLlm(context: Context, transcript: String, habitNames: List<String>): VoiceHabitCommand? {
         val f = TinyLlamaModelFiles.modelFile(context)
         if (!f.isFile || f.length() < TinyLlamaModelFiles.MIN_MODEL_BYTES) {
             Log.i(TAG, "llm skipped: model file missing or too small (${f.length()} bytes)")
@@ -49,7 +47,7 @@ object LlamaInference {
         val system = VoiceLlmPrompts.systemPrompt(habitNames)
         val user = VoiceLlmPrompts.userPrompt(transcript)
         return try {
-            val raw = gen(f.absolutePath, system, user) ?: run {
+            val raw = LocalLlamaRuntime.generateChat(f.absolutePath, system, user) ?: run {
                 setDebug(transcript, "", "skipped:empty_output")
                 return null
             }
@@ -78,7 +76,11 @@ object LlamaInference {
     private fun summarize(command: VoiceHabitCommand?): String =
         when (command) {
             is VoiceHabitCommand.AddHabit -> "AddHabit(name=${command.name})"
-            is VoiceHabitCommand.MarkDone -> "MarkDone(habitName=${command.habitName})"
+            is VoiceHabitCommand.AddHabitDetailed -> "AddHabitDetailed(name=${command.details.name})"
+            is VoiceHabitCommand.MarkDone ->
+                "MarkDone(habitName=${command.habitName}, amount=${command.amount})"
+            is VoiceHabitCommand.DeleteHabit -> "DeleteHabit(habitName=${command.habitName})"
+            is VoiceHabitCommand.ArchiveHabit -> "ArchiveHabit(habitName=${command.habitName})"
             null -> "null"
         }
 

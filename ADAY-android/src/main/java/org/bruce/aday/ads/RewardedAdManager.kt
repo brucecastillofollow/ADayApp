@@ -37,6 +37,7 @@ object RewardedAdManager {
     private var isLoading = false
 
     fun preload(context: Context) {
+        if (!AdsEnvironment.shouldInitializeMobileAds()) return
         if (rewardedAd != null || isLoading) return
 
         isLoading = true
@@ -64,6 +65,10 @@ object RewardedAdManager {
         onReward: (RewardItem) -> Unit,
         onUnavailable: (() -> Unit)? = null
     ): Boolean {
+        if (!AdsEnvironment.shouldInitializeMobileAds()) {
+            onUnavailable?.invoke()
+            return false
+        }
         val ad = rewardedAd
         if (ad == null) {
             onUnavailable?.invoke()

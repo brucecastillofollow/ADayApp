@@ -21,6 +21,7 @@ package org.bruce.aday.activities.habits.list
 
 import android.Manifest.permission.POST_NOTIFICATIONS
 import android.Manifest.permission.RECORD_AUDIO
+import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
@@ -49,16 +50,22 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat.checkSelfPermission
 import androidx.core.view.MenuItemCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.bruce.aday.BaseExceptionHandler
 import org.bruce.aday.HabitsApplication
 import org.bruce.aday.R
+import org.bruce.aday.ads.AdsEnvironment
 import org.bruce.aday.ads.RewardedAdManager
 import org.bruce.aday.activities.habits.list.views.HabitCardListAdapter
+import org.bruce.aday.core.commands.ArchiveHabitsCommand
 import org.bruce.aday.core.commands.CreateHabitCommand
+import org.bruce.aday.core.commands.CreateRepetitionCommand
+import org.bruce.aday.core.commands.DeleteHabitsCommand
 import org.bruce.aday.core.models.Entry.Companion.YES_MANUAL
 import org.bruce.aday.core.models.Frequency
 import org.bruce.aday.core.models.HabitType
@@ -68,6 +75,7 @@ import org.bruce.aday.core.tasks.TaskRunner
 import org.bruce.aday.core.ui.ThemeSwitcher.Companion.THEME_DARK
 import org.bruce.aday.core.utils.MidnightTimer
 import org.bruce.aday.core.utils.DateUtils.Companion.getToday
+import kotlin.math.roundToInt
 import org.bruce.aday.database.AutoBackup
 import org.bruce.aday.inject.ActivityContextModule
 import org.bruce.aday.inject.DaggerHabitsActivityComponent
@@ -80,7 +88,9 @@ import org.bruce.aday.utils.restartWithFade
 import org.bruce.aday.voice.LocalVoiceRecognizer
 import org.bruce.aday.voice.VoiceModelSetupUiState
 import org.bruce.aday.voice.VoiceHabitCommand
+import org.bruce.aday.voice.VoiceHabitCreationDetails
 import org.bruce.aday.voice.llm.LlamaInference
+import org.bruce.aday.voice.llm.LocalLlamaRuntime
 import org.bruce.aday.voice.llm.TinyLlamaModelDownloader
 import org.bruce.aday.voice.llm.TinyLlamaModelFiles
 import org.bruce.aday.voice.llm.VoiceIntentPipeline
@@ -126,7 +136,10 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         }
     private val mainHandler = Handler(Looper.getMainLooper())
     private var voiceOutcomeRunnable: Runnable? = null
+    /** True while the mic is actually capturing (after [LocalVoiceRecognizer] reports listening). */
     private var isVoiceRecording = false
+    /** True from tap until the mic is on — toolbar stays on “preparing”, not “stop recording”. */
+    private var isVoicePreparing = false
     private var voiceModelProgressDialog: AlertDialog? = null
     private var voiceModelProgressBar: ProgressBar? = null
     private var voiceModelProgressLabel: TextView? = null
@@ -135,18 +148,27 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     private var llmDownloadProgressLabel: TextView? = null
     private val voiceIntentScope = MainScope()
 
+    private var savedOnSpeechModelReady: (() -> Unit)? = null
+
+    /** Background TinyLlama mmap/load so the toolbar chip can turn green without a voice command. */
+    private var llmWarmupJob: Job? = null
+
     private val localVoiceRecognizer by lazy {
         LocalVoiceRecognizer(
             context = this,
             onError = { message ->
                 runOnUiThread {
                     isVoiceRecording = false
+                    isVoicePreparing = false
                     applyVoiceMenuState()
                     Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
                 }
             },
             onListening = { listening ->
                 if (listening) {
+                    isVoicePreparing = false
+                    isVoiceRecording = true
+                    applyVoiceMenuState()
                     showRecordingReadyNotification()
                 }
             },
@@ -189,12 +211,19 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             Toast.makeText(this, R.string.voice_model_ready_tap_voice, Toast.LENGTH_LONG).show()
         }
         LocalVoiceRecognizer.onModelSetupUi = { applyVoiceModelSetupUi(it) }
+        savedOnSpeechModelReady = LocalVoiceRecognizer.onSpeechModelReady
+        LocalVoiceRecognizer.onSpeechModelReady = {
+            savedOnSpeechModelReady?.invoke()
+            mainHandler.post { updateModelStatusIndicators() }
+        }
         localVoiceRecognizer.onPartialTranscript = { partial ->
             showLiveCaption(partial)
         }
         if (consumeOpenLlmDownloadIntent()) {
             mainHandler.post { startTinyLlamaDownloadFlow() }
         }
+        LocalLlamaRuntime.onWeightsLoadedStateChanged = { updateModelStatusIndicators() }
+        mainHandler.post { updateModelStatusIndicators() }
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -225,16 +254,28 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
      */
     private fun applyVoiceMenuState() {
         val item = rootView.tbar.menu.findItem(R.id.actionVoiceHabit) ?: return
-        if (isVoiceRecording) {
-            item.title = getString(R.string.voice_stop_recording)
-            item.setIcon(android.R.drawable.ic_media_pause)
-            MenuItemCompat.setIconTintList(item, android.content.res.ColorStateList.valueOf(Color.parseColor("#FF5252")))
-            rootView.tbar.subtitle = getString(R.string.voice_local_listening)
-        } else {
-            item.title = getString(R.string.voice_habit_command)
-            item.setIcon(android.R.drawable.ic_btn_speak_now)
-            MenuItemCompat.setIconTintList(item, null)
-            rootView.tbar.subtitle = null
+        when {
+            isVoicePreparing -> {
+                item.title = getString(R.string.voice_preparing_mic)
+                item.setIcon(android.R.drawable.ic_btn_speak_now)
+                MenuItemCompat.setIconTintList(
+                    item,
+                    android.content.res.ColorStateList.valueOf(Color.parseColor("#FFB74D")),
+                )
+                rootView.tbar.subtitle = getString(R.string.voice_preparing_mic)
+            }
+            isVoiceRecording -> {
+                item.title = getString(R.string.voice_stop_recording)
+                item.setIcon(android.R.drawable.ic_media_pause)
+                MenuItemCompat.setIconTintList(item, android.content.res.ColorStateList.valueOf(Color.parseColor("#FF5252")))
+                rootView.tbar.subtitle = getString(R.string.voice_local_listening)
+            }
+            else -> {
+                item.title = getString(R.string.voice_habit_command)
+                item.setIcon(android.R.drawable.ic_btn_speak_now)
+                MenuItemCompat.setIconTintList(item, null)
+                rootView.tbar.subtitle = null
+            }
         }
     }
 
@@ -263,13 +304,12 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         // abort recording on Galaxy devices. Teardown when the activity is no longer visible.
         if (localVoiceRecognizer.isCaptureActive()) {
             localVoiceRecognizer.stop()
-        } else if (isVoiceRecording) {
+        } else if (isVoiceRecording || isVoicePreparing) {
             // Model may still be downloading; do not call stop() or we cancel the Vosk download.
             localVoiceRecognizer.onHostStoppedDuringModelLoadOnly()
         }
-        if (isVoiceRecording) {
-            isVoiceRecording = false
-        }
+        isVoiceRecording = false
+        isVoicePreparing = false
         applyVoiceMenuState()
         super.onStop()
     }
@@ -311,13 +351,49 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             restartWithFade(ListHabitsActivity::class.java)
         }
         parseIntents()
-        if (!hasShownRewardedAdOnMain) {
+        if (AdsEnvironment.shouldInitializeMobileAds() && !hasShownRewardedAdOnMain) {
             hasShownRewardedAdOnMain = RewardedAdManager.show(
                 this,
                 onReward = { /* no-op: reward flow will be defined later */ }
             )
         }
         super.onResume()
+        updateModelStatusIndicators()
+        scheduleLlmWarmupIfNeeded()
+    }
+
+    /**
+     * The GGUF stays on disk until [LocalLlamaRuntime.ensureLoaded] runs. Application startup
+     * intentionally skips warmup (memory). Here we load after a delay while Habits is visible so the
+     * LLM chip matches reality without requiring a voice path that hits the LLM.
+     */
+    private fun scheduleLlmWarmupIfNeeded() {
+        if (LocalLlamaRuntime.isLlamaWeightsInMemory()) return
+        val f = TinyLlamaModelFiles.modelFile(this)
+        if (!TinyLlamaModelDownloader.isPlausibleModelFile(f)) return
+        if (llmWarmupJob?.isActive == true) return
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val mem = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mem)
+        if (mem.lowMemory) {
+            Log.i("ListHabitsActivity", "llm_warmup: skipped (system lowMemory)")
+            return
+        }
+        llmWarmupJob = voiceIntentScope.launch(Dispatchers.IO) {
+            delay(LLM_WARMUP_DELAY_MS)
+            if (isFinishing || isDestroyed) return@launch
+            if (LocalLlamaRuntime.isLlamaWeightsInMemory()) return@launch
+            try {
+                Log.i("ListHabitsActivity", "llm_warmup: loading TinyLlama into native heap")
+                LocalLlamaRuntime.warmupIfModelPresent(this@ListHabitsActivity)
+            } catch (e: Exception) {
+                Log.w("ListHabitsActivity", "llm_warmup failed", e)
+            } finally {
+                withContext(Dispatchers.Main) {
+                    if (!isFinishing && !isDestroyed) updateModelStatusIndicators()
+                }
+            }
+        }
     }
 
     private fun scheduleReminders() {
@@ -347,6 +423,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         val f = TinyLlamaModelFiles.modelFile(this)
         if (TinyLlamaModelDownloader.isPlausibleModelFile(f)) {
             Toast.makeText(this, R.string.voice_llm_already_downloaded, Toast.LENGTH_SHORT).show()
+            updateModelStatusIndicators()
             return
         }
         AlertDialog.Builder(this)
@@ -378,6 +455,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                     if (!isFinishing && !isDestroyed) {
                         dismissLlmDownloadDialog()
                         Toast.makeText(this@ListHabitsActivity, R.string.voice_llm_download_done, Toast.LENGTH_LONG).show()
+                        updateModelStatusIndicators()
                     } else {
                         Toast.makeText(appCtx, R.string.voice_llm_download_done, Toast.LENGTH_LONG).show()
                     }
@@ -388,6 +466,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                     if (!isFinishing && !isDestroyed) {
                         dismissLlmDownloadDialog()
                         Toast.makeText(this@ListHabitsActivity, R.string.voice_llm_download_failed, Toast.LENGTH_LONG).show()
+                        updateModelStatusIndicators()
                     } else {
                         Toast.makeText(appCtx, R.string.voice_llm_download_failed, Toast.LENGTH_LONG).show()
                     }
@@ -397,6 +476,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     }
 
     private fun applyLlmDownloadProgress(bytesRead: Long, totalBytes: Long) {
+        updateModelStatusIndicators()
         val bar = llmDownloadProgressBar ?: return
         val label = llmDownloadProgressLabel ?: return
         val knownTotal = totalBytes > 0L
@@ -432,6 +512,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         val dialog = createLlmDownloadProgressDialog()
         llmDownloadDialog = dialog
         dialog.show()
+        updateModelStatusIndicators()
     }
 
     private fun createLlmDownloadProgressDialog(): AlertDialog {
@@ -471,6 +552,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         llmDownloadDialog = null
         llmDownloadProgressBar = null
         llmDownloadProgressLabel = null
+        updateModelStatusIndicators()
     }
 
     private fun startVoiceFlow() {
@@ -478,6 +560,12 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             isVoiceRecording = false
             applyVoiceMenuState()
             localVoiceRecognizer.finishSession { handleVoiceSessionEnd(it) }
+            return
+        }
+        if (isVoicePreparing) {
+            isVoicePreparing = false
+            applyVoiceMenuState()
+            localVoiceRecognizer.stop()
             return
         }
         if (localVoiceRecognizer.isSessionFinishInProgress()) {
@@ -507,23 +595,29 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             Toast.makeText(this, R.string.voice_local_starting, Toast.LENGTH_SHORT).show()
             return
         }
-        isVoiceRecording = true
+        isVoicePreparing = true
+        isVoiceRecording = false
         localVoiceRecognizer.start()
         rootView.post { applyVoiceMenuState() }
     }
 
     private fun handleVoiceSessionEnd(transcript: String) {
         isVoiceRecording = false
+        isVoicePreparing = false
         applyVoiceMenuState()
         if (localVoiceRecognizer.consumeSetupCancelled()) {
             Toast.makeText(this, R.string.voice_setup_cancelled_message, Toast.LENGTH_LONG).show()
             return
         }
-        showTranscriptNotification(transcript)
+        val trimmed = transcript.trim()
+        if (trimmed.isEmpty()) {
+            Toast.makeText(this, R.string.voice_not_recognized, Toast.LENGTH_SHORT).show()
+            return
+        }
         voiceOutcomeRunnable?.let { mainHandler.removeCallbacks(it) }
         val runnable = Runnable {
             voiceOutcomeRunnable = null
-            deliverVoiceOutcome(transcript)
+            deliverVoiceOutcome(trimmed)
         }
         voiceOutcomeRunnable = runnable
         mainHandler.postDelayed(runnable, VOICE_OUTCOME_DELAY_MS)
@@ -607,46 +701,6 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         nm.notify(VOICE_READY_NOTIFICATION_ID, builder.build())
     }
 
-    private fun showTranscriptNotification(transcript: String) {
-        val body = transcript.ifBlank { getString(R.string.voice_not_recognized) }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(this, POST_NOTIFICATIONS) != PERMISSION_GRANTED
-        ) {
-            // Long transcripts are truncated in Toast; show scrollable dialog-style feedback
-            AlertDialog.Builder(this)
-                .setTitle(R.string.voice_transcript_title)
-                .setMessage(body)
-                .setPositiveButton(android.R.string.ok, null)
-                .show()
-            return
-        }
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                VOICE_CHANNEL_ID,
-                getString(R.string.voice_transcript_title),
-                NotificationManager.IMPORTANCE_DEFAULT,
-            )
-            nm.createNotificationChannel(ch)
-        }
-        val title = getString(R.string.voice_transcript_title)
-        val bigTextStyle = NotificationCompat.BigTextStyle()
-            .setBigContentTitle(title)
-            .bigText(body)
-        val builder = NotificationCompat.Builder(this, VOICE_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(title)
-            .setContentText(body)
-            .setStyle(bigTextStyle)
-            .setAutoCancel(true)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            builder.setTimeoutAfter(VOICE_NOTIFICATION_TIMEOUT_MS)
-        }
-        nm.notify(VOICE_TRANSCRIPT_NOTIFICATION_ID, builder.build())
-    }
-
     private fun deliverVoiceOutcome(transcript: String) {
         val habitNames = appComponent.habitList.map { it.name }
         showVoiceProcessingState(transcript)
@@ -659,6 +713,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             } finally {
                 withContext(Dispatchers.Main) {
                     clearVoiceProcessingState()
+                    updateModelStatusIndicators()
                 }
             }
         }
@@ -675,6 +730,10 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                 Toast.makeText(this, R.string.voice_understood, Toast.LENGTH_SHORT).show()
                 addHabitFromVoice(command.name, showToast = false)
             }
+            is VoiceHabitCommand.AddHabitDetailed -> {
+                Toast.makeText(this, R.string.voice_understood, Toast.LENGTH_SHORT).show()
+                addHabitDetailedFromVoice(command.details, showToast = false)
+            }
             is VoiceHabitCommand.MarkDone -> {
                 val matched = appComponent.habitList.find {
                     it.name.equals(command.habitName, ignoreCase = true) ||
@@ -684,10 +743,18 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                     Toast.makeText(this, getString(R.string.voice_habit_not_found, command.habitName), Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(this, R.string.voice_understood, Toast.LENGTH_SHORT).show()
-                    markHabitDoneFromVoice(command.habitName, showToast = false)
+                    markHabitDoneFromVoice(command.habitName, command.amount, showToast = false)
                 }
             }
-            null -> Toast.makeText(this, R.string.voice_not_recognized, Toast.LENGTH_SHORT).show()
+            is VoiceHabitCommand.DeleteHabit -> {
+                deleteHabitFromVoice(command.habitName, showToast = true)
+            }
+            is VoiceHabitCommand.ArchiveHabit -> {
+                archiveHabitFromVoice(command.habitName, showToast = true)
+            }
+            null -> {
+                Toast.makeText(this, R.string.voice_not_recognized, Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -696,11 +763,14 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         val rawCompact = snapshot.rawOutput.replace("\n", " ").trim().take(700).ifBlank { "(empty)" }
         val action = when (command) {
             is VoiceHabitCommand.AddHabit -> "Add habit: ${command.name}"
-            is VoiceHabitCommand.MarkDone -> "Mark done: ${command.habitName}"
-            null -> "Not recognized"
+            is VoiceHabitCommand.AddHabitDetailed -> "Add habit (detailed): ${command.details.name}"
+            is VoiceHabitCommand.MarkDone -> "Mark done: ${command.habitName} amount=${command.amount}"
+            is VoiceHabitCommand.DeleteHabit -> "Delete: ${command.habitName}"
+            is VoiceHabitCommand.ArchiveHabit -> "Archive: ${command.habitName}"
+            null -> getString(R.string.voice_not_recognized)
         }
         AlertDialog.Builder(this)
-            .setTitle("Voice + LLM result")
+            .setTitle(R.string.voice_llm_dialog_title)
             .setMessage(
                 "Speech: $transcript\n\n" +
                     "Action: $action\n\n" +
@@ -725,7 +795,28 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         }
     }
 
-    private fun markHabitDoneFromVoice(name: String, showToast: Boolean = true) {
+    private fun addHabitDetailedFromVoice(details: VoiceHabitCreationDetails, showToast: Boolean = true) {
+        val habit = appComponent.modelFactory.buildHabit()
+        habit.name = details.name
+        habit.question = details.question ?: "Did you ${details.name}?"
+        habit.description = details.notes ?: ""
+        habit.frequency = details.frequency
+        details.color?.let { habit.color = it }
+        habit.type = details.habitType
+        habit.reminder = details.reminder
+        if (details.habitType == HabitType.NUMERICAL) {
+            habit.unit = details.unit
+            habit.targetValue = details.targetValue
+            habit.targetType = details.targetType
+        }
+        appComponent.commandRunner.run(CreateHabitCommand(appComponent.modelFactory, appComponent.habitList, habit))
+        adapter.refresh()
+        if (showToast) {
+            Toast.makeText(this, getString(R.string.voice_added_habit, details.name), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun markHabitDoneFromVoice(name: String, amount: Double?, showToast: Boolean = true) {
         val matchedHabit = appComponent.habitList.find {
             it.name.equals(name, ignoreCase = true) || it.name.contains(name, ignoreCase = true)
         }
@@ -735,10 +826,55 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
             }
             return
         }
-        component.listHabitsBehavior.onToggle(matchedHabit, getToday(), YES_MANUAL, "", 0f, 0f)
+        if (matchedHabit.isNumerical) {
+            if (amount == null || amount <= 0.0) {
+                Toast.makeText(this, R.string.voice_numerical_need_amount, Toast.LENGTH_SHORT).show()
+                return
+            }
+            val valueInt = (amount * 1000.0).roundToInt()
+            appComponent.commandRunner.run(
+                CreateRepetitionCommand(appComponent.habitList, matchedHabit, getToday(), valueInt, ""),
+            )
+        } else {
+            component.listHabitsBehavior.onToggle(matchedHabit, getToday(), YES_MANUAL, "", 0f, 0f)
+        }
         adapter.refresh()
         if (showToast) {
             Toast.makeText(this, getString(R.string.voice_marked_done, matchedHabit.name), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun deleteHabitFromVoice(name: String, showToast: Boolean = true) {
+        val matchedHabit = appComponent.habitList.find {
+            it.name.equals(name, ignoreCase = true) || it.name.contains(name, ignoreCase = true)
+        }
+        if (matchedHabit == null) {
+            if (showToast) {
+                Toast.makeText(this, getString(R.string.voice_habit_not_found, name), Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        appComponent.commandRunner.run(DeleteHabitsCommand(appComponent.habitList, listOf(matchedHabit)))
+        adapter.refresh()
+        if (showToast) {
+            Toast.makeText(this, resources.getQuantityString(R.plurals.toast_habits_deleted, 1), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun archiveHabitFromVoice(name: String, showToast: Boolean = true) {
+        val matchedHabit = appComponent.habitList.find {
+            it.name.equals(name, ignoreCase = true) || it.name.contains(name, ignoreCase = true)
+        }
+        if (matchedHabit == null) {
+            if (showToast) {
+                Toast.makeText(this, getString(R.string.voice_habit_not_found, name), Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        appComponent.commandRunner.run(ArchiveHabitsCommand(appComponent.habitList, listOf(matchedHabit)))
+        adapter.refresh()
+        if (showToast) {
+            Toast.makeText(this, resources.getQuantityString(R.plurals.toast_habits_archived, 1), Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -762,17 +898,42 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
     }
 
     override fun onDestroy() {
+        llmWarmupJob?.cancel()
+        llmWarmupJob = null
         clearVoiceProcessingState()
         voiceIntentScope.cancel()
         LocalVoiceRecognizer.onModelSetupUi = null
+        LocalLlamaRuntime.onWeightsLoadedStateChanged = null
+        LocalVoiceRecognizer.onSpeechModelReady = savedOnSpeechModelReady
+        savedOnSpeechModelReady = null
         dismissVoiceModelProgressDialog()
         dismissLlmDownloadDialog()
         super.onDestroy()
     }
 
+    private fun updateModelStatusIndicators() {
+        if (isFinishing || isDestroyed) return
+        val f = TinyLlamaModelFiles.modelFile(this)
+        val llmDisk = TinyLlamaModelDownloader.isPlausibleModelFile(f)
+        val llmRam = LocalLlamaRuntime.isLlamaWeightsInMemory()
+        val speechReady = LocalVoiceRecognizer.isSpeechModelLoaded()
+        val speechLoading = localVoiceRecognizer.isModelLoadInProgress()
+        val llmDownloading = llmDownloadDialog?.isShowing == true
+        rootView.refreshModelStatusIndicators(
+            llmInMemory = llmRam,
+            llmDownloading = llmDownloading,
+            llmFileOnDisk = llmDisk,
+            speechReady = speechReady,
+            speechLoading = speechLoading,
+        )
+    }
+
     private fun applyVoiceModelSetupUi(state: VoiceModelSetupUiState) {
         when (state) {
-            VoiceModelSetupUiState.Dismiss -> dismissVoiceModelProgressDialog()
+            VoiceModelSetupUiState.Dismiss -> {
+                dismissVoiceModelProgressDialog()
+                updateModelStatusIndicators()
+            }
             is VoiceModelSetupUiState.Downloading -> {
                 ensureVoiceModelProgressDialogShown()
                 val bar = voiceModelProgressBar ?: return
@@ -794,16 +955,19 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                 } else {
                     getString(R.string.voice_model_progress_download_unknown, readStr)
                 }
+                updateModelStatusIndicators()
             }
             VoiceModelSetupUiState.Unzipping -> {
                 ensureVoiceModelProgressDialogShown()
                 voiceModelProgressBar?.isIndeterminate = true
                 voiceModelProgressLabel?.setText(R.string.voice_model_progress_unzipping)
+                updateModelStatusIndicators()
             }
             VoiceModelSetupUiState.LoadingVosk -> {
                 ensureVoiceModelProgressDialogShown()
                 voiceModelProgressBar?.isIndeterminate = true
                 voiceModelProgressLabel?.setText(R.string.voice_model_progress_loading_vosk)
+                updateModelStatusIndicators()
             }
         }
     }
@@ -853,16 +1017,14 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         /** Settings / deep link: open habits screen and start the TinyLlama GGUF download flow. */
         const val EXTRA_OPEN_LLM_DOWNLOAD = "org.bruce.aday.extra.OPEN_LLM_DOWNLOAD"
         private var hasShownRewardedAdOnMain = false
-        /** New id so channel importance can be upgraded (Android ignores updates to an existing channel id). */
-        private const val VOICE_CHANNEL_ID = "voice_transcript_v2"
         private const val VOICE_STATUS_CHANNEL_ID = "voice_status_v1"
         private const val VOICE_PROCESSING_CHANNEL_ID = "voice_processing_v1"
-        private const val VOICE_TRANSCRIPT_NOTIFICATION_ID = 90421
         private const val VOICE_READY_NOTIFICATION_ID = 90420
         private const val VOICE_PROCESSING_NOTIFICATION_ID = 90423
-        private const val VOICE_NOTIFICATION_TIMEOUT_MS = 5000L
         private const val VOICE_READY_TIMEOUT_MS = 6000L
-        /** Short pause so the “Heard” notification can post before the processing spinner. */
+        /** Brief pause before command processing so UI can settle after recording stops. */
         private const val VOICE_OUTCOME_DELAY_MS = 200L
+        /** Stagger after cold start (Vosk, DB) before mmap of ~764MB GGUF. */
+        private const val LLM_WARMUP_DELAY_MS = 12_000L
     }
 }
