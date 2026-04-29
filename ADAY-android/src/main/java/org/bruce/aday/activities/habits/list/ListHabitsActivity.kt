@@ -738,7 +738,13 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         showVoiceProcessingState(transcript)
         voiceIntentScope.launch(Dispatchers.Default) {
             try {
-                val command = VoiceIntentPipeline.resolve(this@ListHabitsActivity, transcript, habitNames)
+                val useLlm = prefs.voicePostRecognitionMode != Preferences.VOICE_POST_RECOGNITION_FUZZY_ONLY
+                val command = VoiceIntentPipeline.resolve(
+                    this@ListHabitsActivity,
+                    transcript,
+                    habitNames,
+                    useLocalLlmAfterHeuristics = useLlm,
+                )
                 withContext(Dispatchers.Main) {
                     applyVoiceCommandOutcome(transcript, command)
                 }

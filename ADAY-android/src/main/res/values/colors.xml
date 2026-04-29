@@ -88,6 +88,7 @@
         <item>@color/black_aa</item>
     </array>
 
-    <color name="ic_launcher_background">#1976D2</color>
+    <!-- ADAY launcher tile (pairs with ic_launcher_foreground_aday) -->
+    <color name="ic_launcher_background">#0D47A1</color>
     <color name="color_background">@color/grey_200</color>
 </resources>

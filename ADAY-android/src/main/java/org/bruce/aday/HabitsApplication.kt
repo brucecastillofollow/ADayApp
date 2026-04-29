@@ -226,7 +226,7 @@ class HabitsApplication : Application() {
         }
         val b = NotificationCompat.Builder(this, LLM_STARTUP_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("ADay offline AI")
+            .setContentTitle("ADAY offline AI")
             .setContentText(message)
             .setOnlyAlertOnce(true)
             .setOngoing(!autoCancel)

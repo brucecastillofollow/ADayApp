@@ -118,6 +118,11 @@ android {
     androidResources {
         noCompress += listOf("zip", "gguf", "bin")
     }
+
+    // Built APK/AAB files use this basename (e.g. ADAY-debug.apk); launcher title is @string/app_name.
+    base {
+        archivesName = "ADAY"
+    }
 }
 
 dependencies {

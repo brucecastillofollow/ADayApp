@@ -101,7 +101,11 @@ class EditHabitActivity : AppCompatActivity() {
         if (intent.hasExtra("habitId")) {
             binding.toolbar.title = getString(R.string.edit_habit)
             habitId = intent.getLongExtra("habitId", -1)
-            val habit = component.habitList.getById(habitId)!!
+            val habit = component.habitList.getById(habitId)
+            if (habit == null) {
+                finish()
+                return
+            }
             habitType = habit.type
             color = habit.color
             freqNum = habit.frequency.numerator
@@ -264,7 +268,11 @@ class EditHabitActivity : AppCompatActivity() {
 
         var original: Habit? = null
         if (habitId >= 0) {
-            original = component.habitList.getById(habitId)!!
+            original = component.habitList.getById(habitId)
+            if (original == null) {
+                finish()
+                return
+            }
             habit.copyFrom(original)
         }
 

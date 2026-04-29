@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Foreground for adaptive launcher icon: stylized "A" mark for ADAY (108×108 dp safe area).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,26 L78,82 H68.5 L63.2,66.5 H44.8 L39.5,82 H30 Z M54,38.5 L47.8,58.5 H60.2 Z" />
+</vector>

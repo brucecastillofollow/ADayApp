@@ -212,6 +212,31 @@ open class Preferences(private val storage: Storage) {
         }
 
     /**
+     * How to interpret voice transcripts after speech recognition.
+     * [VOICE_POST_RECOGNITION_LLM] runs the local model when rules and heuristics do not match;
+     * [VOICE_POST_RECOGNITION_FUZZY_ONLY] uses fuzzy matching only (no LLM).
+     */
+    var voicePostRecognitionMode: String
+        get() {
+            val v = storage.getString(KEY_VOICE_POST_RECOGNITION, VOICE_POST_RECOGNITION_LLM)
+            return if (v == VOICE_POST_RECOGNITION_FUZZY_ONLY) {
+                VOICE_POST_RECOGNITION_FUZZY_ONLY
+            } else {
+                VOICE_POST_RECOGNITION_LLM
+            }
+        }
+        set(value) {
+            storage.putString(
+                KEY_VOICE_POST_RECOGNITION,
+                if (value == VOICE_POST_RECOGNITION_FUZZY_ONLY) {
+                    VOICE_POST_RECOGNITION_FUZZY_ONLY
+                } else {
+                    VOICE_POST_RECOGNITION_LLM
+                },
+            )
+        }
+
+    /**
      * @return An integer representing the first day of the week. Sunday
      * corresponds to 1, Monday to 2, and so on, until Saturday, which is
      * represented by 7. By default, this is based on the current system locale,
@@ -276,5 +301,11 @@ open class Preferences(private val storage: Storage) {
     init {
         listeners = LinkedList()
         storage.onAttached(this)
+    }
+
+    companion object {
+        const val VOICE_POST_RECOGNITION_LLM = "llm"
+        const val VOICE_POST_RECOGNITION_FUZZY_ONLY = "fuzzy_only"
+        private const val KEY_VOICE_POST_RECOGNITION = "pref_voice_post_recognition"
     }
 }

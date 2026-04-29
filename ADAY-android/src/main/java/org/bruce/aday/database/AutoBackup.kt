@@ -55,7 +55,10 @@ class AutoBackup(private val context: Context) {
     }
 
     private fun runInPrivateDir(dir: File, keep: Int) {
-        val files = dir.listFiles()?.toMutableList() ?: mutableListOf()
+        val files = dir.listFiles()
+            ?.filter { it.isFile && it.name.matches(backupPattern) }
+            ?.toMutableList()
+            ?: mutableListOf()
         files.sortBy { it.lastModified() }
         val newestTimestamp = files.lastOrNull()?.lastModified() ?: 0L
         removeOldestPrivate(files, keep)

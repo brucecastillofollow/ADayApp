@@ -136,15 +136,23 @@ object VoskModelPreparer {
 
     private fun unzipToDirectory(zipFile: File, destDir: File): Boolean {
         return try {
+            val canonicalDestDir = destDir.canonicalFile
+            val allowedPrefix = canonicalDestDir.path + File.separator
             ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
                 var entry = zis.nextEntry
                 while (entry != null) {
                     val outFile = File(destDir, entry.name)
+                    val canonicalOutFile = outFile.canonicalFile
+                    if (canonicalOutFile.path != canonicalDestDir.path &&
+                        !canonicalOutFile.path.startsWith(allowedPrefix)
+                    ) {
+                        throw IllegalStateException("Blocked zip entry outside destination: ${entry.name}")
+                    }
                     if (entry.isDirectory) {
-                        outFile.mkdirs()
+                        canonicalOutFile.mkdirs()
                     } else {
-                        outFile.parentFile?.mkdirs()
-                        FileOutputStream(outFile).use { fos ->
+                        canonicalOutFile.parentFile?.mkdirs()
+                        FileOutputStream(canonicalOutFile).use { fos ->
                             zis.copyTo(fos)
                         }
                     }

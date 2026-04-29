@@ -94,6 +94,15 @@
             android:key="voiceCategory"
             android:title="@string/voice_llm_settings_category">
 
+        <ListPreference
+            android:key="pref_voice_post_recognition"
+            android:title="@string/pref_voice_post_recognition_title"
+            android:summary="%s"
+            android:entries="@array/pref_voice_post_recognition_entries"
+            android:entryValues="@array/pref_voice_post_recognition_values"
+            android:defaultValue="llm"
+            app:iconSpaceReserved="false" />
+
         <Preference
                 android:key="downloadVoiceLlm"
                 android:summary="@string/voice_llm_settings_summary"

@@ -22,8 +22,11 @@
     xmlns:tools="http://schemas.android.com/tools"
     tools:ignore="MissingTranslation">
 
-    <string name="app_name" >ADay</string>
-    <string name="main_activity_title">Habits</string>
+    <string name="app_name">ADAY</string>
+    <!-- Shown next to toolbar actions; full status is in contentDescription -->
+    <string name="toolbar_chip_llm_short">AI</string>
+    <string name="toolbar_chip_speech_short">Voice</string>
+    <string name="main_activity_title">@string/app_name</string>
     <string name="toolbar_status_llm_ready">LLM model loaded in memory</string>
     <string name="toolbar_status_llm_downloading">LLM model downloading</string>
     <string name="toolbar_status_llm_on_disk">LLM model on device, not loaded yet</string>
@@ -71,7 +74,19 @@
     <string name="voice_llm_progress_title">Offline AI model</string>
     <string name="voice_llm_download_preparing">Preparing download…</string>
     <string name="voice_llm_settings_category">Voice</string>
+    <string name="pref_voice_post_recognition_title">Understand commands after speech</string>
+    <string name="pref_voice_post_recognition_entry_llm">Offline AI when needed (TinyLlama)</string>
+    <string name="pref_voice_post_recognition_entry_fuzzy">Fuzzy matching only (no AI model)</string>
     <string name="voice_llm_settings_summary">Optional ~750 MB file (Q5) for smarter offline voice commands. Tap to download.</string>
+
+    <string-array name="pref_voice_post_recognition_entries">
+        <item>@string/pref_voice_post_recognition_entry_llm</item>
+        <item>@string/pref_voice_post_recognition_entry_fuzzy</item>
+    </string-array>
+    <string-array name="pref_voice_post_recognition_values">
+        <item>llm</item>
+        <item>fuzzy_only</item>
+    </string-array>
     <string name="voice_local_listening">Listening offline...</string>
     <string name="voice_processing_command">Processing voice command…</string>
     <string name="voice_status_whisper_transcribing">Transcribing speech (Whisper)…</string>
@@ -117,7 +132,7 @@
     <string name="check">Check</string>
     <string name="snooze">Later</string>
     <string name="intro_title_1">Welcome</string>
-    <string name="intro_description_1">ADay helps you create and maintain good habits.</string>
+    <string name="intro_description_1">ADAY helps you create and maintain good habits.</string>
     <string name="intro_title_2">Create some new habits</string>
     <string name="intro_description_2">Every day, after performing your habit, put a checkmark on the app.</string>
     <string name="intro_title_4">Track your progress</string>

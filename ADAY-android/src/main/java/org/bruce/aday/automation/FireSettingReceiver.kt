@@ -44,6 +44,7 @@ class FireSettingReceiver : BroadcastReceiver() {
     private lateinit var allHabits: HabitList
 
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != "com.twofortyfouram.locale.intent.action.FIRE_SETTING") return
         val app = context.applicationContext as HabitsApplication
         val component = DaggerFireSettingReceiver_ReceiverComponent
             .builder()

@@ -169,4 +169,14 @@ class PreferencesTest : BaseUnitTest() {
         prefs.isMidnightDelayEnabled = true
         assertTrue(prefs.isMidnightDelayEnabled)
     }
+
+    @Test
+    @Throws(Exception::class)
+    fun testVoicePostRecognitionMode() {
+        assertThat(prefs.voicePostRecognitionMode, equalTo(Preferences.VOICE_POST_RECOGNITION_LLM))
+        prefs.voicePostRecognitionMode = Preferences.VOICE_POST_RECOGNITION_FUZZY_ONLY
+        assertThat(prefs.voicePostRecognitionMode, equalTo(Preferences.VOICE_POST_RECOGNITION_FUZZY_ONLY))
+        prefs.voicePostRecognitionMode = "bogus"
+        assertThat(prefs.voicePostRecognitionMode, equalTo(Preferences.VOICE_POST_RECOGNITION_LLM))
+    }
 }
