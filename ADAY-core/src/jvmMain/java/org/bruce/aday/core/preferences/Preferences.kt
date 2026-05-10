@@ -218,7 +218,7 @@ open class Preferences(private val storage: Storage) {
      */
     var voicePostRecognitionMode: String
         get() {
-            val v = storage.getString(KEY_VOICE_POST_RECOGNITION, VOICE_POST_RECOGNITION_LLM)
+            val v = storage.getString(KEY_VOICE_POST_RECOGNITION, VOICE_POST_RECOGNITION_FUZZY_ONLY)
             return if (v == VOICE_POST_RECOGNITION_FUZZY_ONLY) {
                 VOICE_POST_RECOGNITION_FUZZY_ONLY
             } else {
@@ -232,6 +232,30 @@ open class Preferences(private val storage: Storage) {
                     VOICE_POST_RECOGNITION_FUZZY_ONLY
                 } else {
                     VOICE_POST_RECOGNITION_LLM
+                },
+            )
+        }
+
+    /**
+     * Where speech-to-text runs: on-device Vosk ([VOICE_SPEECH_OFFLINE], default) or
+     * Android system online recognizer ([VOICE_SPEECH_ONLINE]) when network and service are available.
+     */
+    var voiceSpeechRecognitionMode: String
+        get() {
+            val v = storage.getString(KEY_VOICE_SPEECH_RECOGNITION, VOICE_SPEECH_OFFLINE)
+            return if (v == VOICE_SPEECH_ONLINE) {
+                VOICE_SPEECH_ONLINE
+            } else {
+                VOICE_SPEECH_OFFLINE
+            }
+        }
+        set(value) {
+            storage.putString(
+                KEY_VOICE_SPEECH_RECOGNITION,
+                if (value == VOICE_SPEECH_ONLINE) {
+                    VOICE_SPEECH_ONLINE
+                } else {
+                    VOICE_SPEECH_OFFLINE
                 },
             )
         }
@@ -307,5 +331,9 @@ open class Preferences(private val storage: Storage) {
         const val VOICE_POST_RECOGNITION_LLM = "llm"
         const val VOICE_POST_RECOGNITION_FUZZY_ONLY = "fuzzy_only"
         private const val KEY_VOICE_POST_RECOGNITION = "pref_voice_post_recognition"
+
+        const val VOICE_SPEECH_OFFLINE = "offline"
+        const val VOICE_SPEECH_ONLINE = "online"
+        private const val KEY_VOICE_SPEECH_RECOGNITION = "pref_voice_speech_recognition"
     }
 }

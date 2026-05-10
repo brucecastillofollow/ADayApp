@@ -34,6 +34,7 @@ import com.google.android.gms.ads.MobileAds
 import org.bruce.aday.ads.AdsEnvironment
 import org.bruce.aday.ads.RewardedAdManager
 import org.bruce.aday.core.database.UnsupportedDatabaseVersionException
+import org.bruce.aday.core.preferences.Preferences
 import org.bruce.aday.core.reminders.ReminderScheduler
 import org.bruce.aday.core.ui.NotificationTray
 import org.bruce.aday.core.utils.DateUtils.Companion.setStartDayOffset
@@ -159,7 +160,12 @@ class HabitsApplication : Application() {
             onError = { msg -> Log.e("ADayVoice", msg) },
             onListening = {},
         )
-        voiceModelPrefetch?.prefetchModelIfNeeded()
+        // Defer Vosk prefetch so cold start, DB, and system UI (e.g. SAF file picker) are not
+        // competing with large model I/O on the same storage queue (reduces cross-process ANRs).
+        applicationScope.launch(Dispatchers.IO) {
+            delay(VOICE_MODEL_PREFETCH_DELAY_MS)
+            voiceModelPrefetch?.prefetchModelIfNeeded()
+        }
 
         if (AdsEnvironment.shouldInitializeMobileAds()) {
             applicationScope.launch(Dispatchers.Main) {
@@ -177,9 +183,18 @@ class HabitsApplication : Application() {
 
         applicationScope.launch(Dispatchers.IO) {
             try {
-                // Stagger vs Whisper speech-model download so first frame / DB / launcher transition are not
-                // competing with a ~750MB GGUF read+write on the same storage queue.
-                delay(6_000)
+                // Stagger vs cold start so first frames / navigation (including DocumentsUI) are not
+                // starved by a ~750MB GGUF read+write on the same storage queue.
+                delay(LLM_AUTO_DOWNLOAD_START_DELAY_MS)
+                if (component.preferences.voicePostRecognitionMode ==
+                    Preferences.VOICE_POST_RECOGNITION_FUZZY_ONLY
+                ) {
+                    Log.i(
+                        "ADayVoiceLlm",
+                        "startup: skip TinyLlama auto-download (fuzzy-only; download from Voice settings if needed)",
+                    )
+                    return@launch
+                }
                 val f = TinyLlamaModelFiles.modelFile(applicationContext)
                 if (!TinyLlamaModelDownloader.isPlausibleModelFile(f)) {
                     postLlmStartupNotification("Preparing offline AI model...", null)
@@ -254,6 +269,8 @@ class HabitsApplication : Application() {
         lateinit var component: HabitsApplicationComponent
         private const val LLM_STARTUP_CHANNEL_ID = "llm_startup_v1"
         private const val LLM_STARTUP_NOTIFICATION_ID = 90422
+        private const val VOICE_MODEL_PREFETCH_DELAY_MS = 15_000L
+        private const val LLM_AUTO_DOWNLOAD_START_DELAY_MS = 25_000L
 
         fun isTestMode(): Boolean {
             return try {

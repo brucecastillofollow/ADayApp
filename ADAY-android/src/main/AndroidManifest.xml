@@ -56,7 +56,7 @@
             android:value="AEdPqrEAAAAI6aeWncbnMNo8E5GWeZ44dlc5cQ7tCROwFhOtiw" />
         <meta-data
             android:name="com.google.android.gms.ads.APPLICATION_ID"
-            android:value="ca-app-pub-3823012706757551~3023463828" />
+            android:value="ca-app-pub-3940185689979323~5895727060" />
 
         <activity
             android:name=".activities.habits.list.ListHabitsActivity"

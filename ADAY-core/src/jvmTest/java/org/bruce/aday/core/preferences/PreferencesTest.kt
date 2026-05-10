@@ -173,10 +173,20 @@ class PreferencesTest : BaseUnitTest() {
     @Test
     @Throws(Exception::class)
     fun testVoicePostRecognitionMode() {
-        assertThat(prefs.voicePostRecognitionMode, equalTo(Preferences.VOICE_POST_RECOGNITION_LLM))
+        assertThat(prefs.voicePostRecognitionMode, equalTo(Preferences.VOICE_POST_RECOGNITION_FUZZY_ONLY))
         prefs.voicePostRecognitionMode = Preferences.VOICE_POST_RECOGNITION_FUZZY_ONLY
         assertThat(prefs.voicePostRecognitionMode, equalTo(Preferences.VOICE_POST_RECOGNITION_FUZZY_ONLY))
         prefs.voicePostRecognitionMode = "bogus"
         assertThat(prefs.voicePostRecognitionMode, equalTo(Preferences.VOICE_POST_RECOGNITION_LLM))
+    }
+
+    @Test
+    @Throws(Exception::class)
+    fun testVoiceSpeechRecognitionMode() {
+        assertThat(prefs.voiceSpeechRecognitionMode, equalTo(Preferences.VOICE_SPEECH_OFFLINE))
+        prefs.voiceSpeechRecognitionMode = Preferences.VOICE_SPEECH_ONLINE
+        assertThat(prefs.voiceSpeechRecognitionMode, equalTo(Preferences.VOICE_SPEECH_ONLINE))
+        prefs.voiceSpeechRecognitionMode = "bogus"
+        assertThat(prefs.voiceSpeechRecognitionMode, equalTo(Preferences.VOICE_SPEECH_OFFLINE))
     }
 }

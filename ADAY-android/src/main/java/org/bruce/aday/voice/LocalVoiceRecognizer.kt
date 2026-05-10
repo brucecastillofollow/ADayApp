@@ -22,7 +22,9 @@ import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.whispercpp.whisper.WhisperLib
+import org.bruce.aday.HabitsApplication
 import org.bruce.aday.R
+import org.bruce.aday.core.preferences.Preferences
 import java.io.BufferedInputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -77,6 +79,8 @@ class LocalVoiceRecognizer(
     var onTimeoutWithTranscript: ((String) -> Unit)? = null
     /** Invoked on the main thread with live partial speech text while recording. */
     var onPartialTranscript: ((String) -> Unit)? = null
+    /** Invoked on the main thread when a WAV copy is exported to public storage. */
+    var onRecordingExported: ((String) -> Unit)? = null
 
     /**
      * Main thread: non-null while offline Whisper is transcribing after recording; null when that phase ends.
@@ -91,6 +95,7 @@ class LocalVoiceRecognizer(
     private var liveCaptionThread: Thread? = null
     private var androidSpeechRecognizer: SpeechRecognizer? = null
     private var androidSpeechRestartRunnable: Runnable? = null
+    private var onlineClientErrorCountdownRunnable: Runnable? = null
 
     /** Set while the mic is open so [signalCaptureStop] can unblock [AudioRecord.read]. */
     @Volatile
@@ -124,6 +129,7 @@ class LocalVoiceRecognizer(
 
     /** Vosk streaming session (offline). */
     private var voskSpeechService: SpeechService? = null
+    private var offlineVoskCaptureThread: Thread? = null
 
     private var onlineStopLatch: CountDownLatch? = null
 
@@ -160,7 +166,7 @@ class LocalVoiceRecognizer(
     fun isModelLoadInProgress(): Boolean {
         val t = modelLoadThread ?: return false
         if (!t.isAlive) return false
-        if (NetworkConnectivity.isLikelyOnline(context)) return false
+        if (readShouldUseOnlineSpeechRoute(context)) return false
         return cachedVoskModel == null
     }
 
@@ -200,8 +206,8 @@ class LocalVoiceRecognizer(
      * Prefetches offline Vosk model when device is offline-capable path; skips when online (network SR).
      */
     fun prefetchModelIfNeeded() {
-        if (NetworkConnectivity.isLikelyOnline(context)) {
-            Log.i(LOG_TAG, "prefetch_model: skipped (online — system speech recognizer)")
+        if (readShouldUseOnlineSpeechRoute(context)) {
+            Log.i(LOG_TAG, "prefetch_model: skipped (online speech preferred and available)")
             return
         }
         if (cachedVoskModel != null) {
@@ -276,10 +282,20 @@ class LocalVoiceRecognizer(
         modelLoadThread = null
         when (voiceRoute) {
             VoiceRoute.ONLINE_ANDROID_SR -> shutdownOnlineRecognizerAndWaitForResult()
-            VoiceRoute.OFFLINE_VOSK -> shutdownVoskOnMainThread()
+            VoiceRoute.OFFLINE_VOSK -> joinOfflineVoskCapture()
             else -> joinCapturePipeline(CAPTURE_JOIN_MS)
         }
         postListening(false)
+    }
+
+    private fun joinOfflineVoskCapture() {
+        try {
+            offlineVoskCaptureThread?.join(CAPTURE_JOIN_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        offlineVoskCaptureThread = null
+        shutdownVoskOnMainThread()
     }
 
     private fun shutdownOnlineRecognizerAndWaitForResult() {
@@ -287,6 +303,8 @@ class LocalVoiceRecognizer(
         onlineStopLatch = latch
         mainHandler.post {
             try {
+                onlineClientErrorCountdownRunnable?.let { mainHandler.removeCallbacks(it) }
+                onlineClientErrorCountdownRunnable = null
                 androidSpeechRecognizer?.stopListening()
             } catch (_: Exception) {
                 latch.countDown()
@@ -321,6 +339,10 @@ class LocalVoiceRecognizer(
             VoiceRoute.OFFLINE_VOSK -> mainHandler.post {
                 try {
                     voskSpeechService?.stop()
+                } catch (_: Exception) {
+                }
+                try {
+                    captureAudioRecord?.stop()
                 } catch (_: Exception) {
                 }
             }
@@ -395,7 +417,10 @@ class LocalVoiceRecognizer(
                 LOG_TAG,
                 "voice_final_from_file path=${wav.absolutePath} pcmBytes=${pcm.size} trimmedPcmBytes=${trimmedPcm.size} transcript=\"$text\"",
             )
-            exportWavToPublicDownloads(context, wavBytes, wav.name)
+            val exportedLocation = exportWavToPublicDownloads(context, wavBytes, wav.name)
+            if (!exportedLocation.isNullOrBlank()) {
+                mainHandler.post { onRecordingExported?.invoke(exportedLocation) }
+            }
         } catch (e: Exception) {
             Log.e(LOG_TAG, "voice_finalize_wav_failed", e)
         } finally {
@@ -431,7 +456,9 @@ class LocalVoiceRecognizer(
     }
 
     private fun ensureModelAndStart() {
-        voiceRoute = if (NetworkConnectivity.isLikelyOnline(context)) {
+        // Close any stale setup UI from previous attempts before picking a new route.
+        postModelSetupUi(VoiceModelSetupUiState.Dismiss)
+        voiceRoute = if (readShouldUseOnlineSpeechRoute(context)) {
             VoiceRoute.ONLINE_ANDROID_SR
         } else {
             VoiceRoute.OFFLINE_VOSK
@@ -489,6 +516,8 @@ class LocalVoiceRecognizer(
                     mainHandler.post { onDeferredModelReady?.invoke() }
                     return@Thread
                 }
+                // Success path: model is ready and we are about to listen, so hide setup progress UI.
+                postModelSetupUi(VoiceModelSetupUiState.Dismiss)
                 mainHandler.post { startOfflineVoskListeningSession() }
             } catch (_: ModelSetupCancelled) {
                 if (!prefetchFromApp) {
@@ -513,14 +542,20 @@ class LocalVoiceRecognizer(
     }
 
     /**
-     * [SpeechRecognizer.ERROR_TOO_MANY_REQUESTS]: system throttled online ASR — continue with Vosk
-     * so the user does not have to wait or retry manually.
+     * For transient/availability failures in Android online SR, continue with Vosk so the user
+     * does not have to retry manually.
      */
-    private fun tryFallbackToOfflineVoskFromOnlineRateLimit(error: Int): Boolean {
-        if (error != SpeechRecognizer.ERROR_TOO_MANY_REQUESTS) return false
+    private fun tryFallbackToOfflineVoskFromOnlineError(error: Int): Boolean {
+        val shouldFallback = error == SpeechRecognizer.ERROR_TOO_MANY_REQUESTS ||
+            error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT ||
+            error == SpeechRecognizer.ERROR_NETWORK ||
+            error == SpeechRecognizer.ERROR_SERVER ||
+            error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED ||
+            error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+        if (!shouldFallback) return false
         if (voiceRoute != VoiceRoute.ONLINE_ANDROID_SR) return false
         if (loadCancelled || sessionFinishInProgress) return false
-        Log.i(LOG_TAG, "online_sr_rate_limited — falling back to offline Vosk")
+        Log.i(LOG_TAG, "online_sr_error_fallback_to_offline code=$error")
         voiceRoute = VoiceRoute.OFFLINE_VOSK
         try {
             androidSpeechRecognizer?.cancel()
@@ -557,16 +592,33 @@ class LocalVoiceRecognizer(
                     override fun onEndOfSpeech() {}
                     override fun onError(error: Int) {
                         Log.w(LOG_TAG, "online_sr_error code=$error")
-                        if (tryFallbackToOfflineVoskFromOnlineRateLimit(error)) {
+                        if (tryFallbackToOfflineVoskFromOnlineError(error)) {
                             return
                         }
                         if (error != SpeechRecognizer.ERROR_CLIENT) {
+                            onlineClientErrorCountdownRunnable?.let { mainHandler.removeCallbacks(it) }
+                            onlineClientErrorCountdownRunnable = null
                             lastTranscript = ""
+                            onlineStopLatch?.countDown()
+                            postListening(false)
+                            return
                         }
-                        onlineStopLatch?.countDown()
-                        postListening(false)
+                        // Many devices dispatch ERROR_CLIENT right after stopListening(), then send
+                        // final onResults slightly later. Give a short grace window before closing.
+                        onlineClientErrorCountdownRunnable?.let { mainHandler.removeCallbacks(it) }
+                        onlineClientErrorCountdownRunnable = Runnable {
+                            onlineStopLatch?.countDown()
+                            postListening(false)
+                            onlineClientErrorCountdownRunnable = null
+                        }
+                        mainHandler.postDelayed(
+                            onlineClientErrorCountdownRunnable!!,
+                            ONLINE_CLIENT_ERROR_GRACE_MS,
+                        )
                     }
                     override fun onResults(results: Bundle?) {
+                        onlineClientErrorCountdownRunnable?.let { mainHandler.removeCallbacks(it) }
+                        onlineClientErrorCountdownRunnable = null
                         val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         lastTranscript = list?.firstOrNull()?.trim().orEmpty()
                         Log.i(LOG_TAG, "online_sr_result text=\"$lastTranscript\"")
@@ -602,51 +654,118 @@ class LocalVoiceRecognizer(
             mainHandler.post { onError("Offline speech model not loaded") }
             return
         }
-        mainHandler.post {
+        if (offlineVoskCaptureThread?.isAlive == true) {
+            Log.i(LOG_TAG, "offline_vosk_listening_already_running")
+            return
+        }
+        offlineVoskCaptureThread = Thread {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+            var audioRecord: AudioRecord? = null
+            var raf: RandomAccessFile? = null
+            var recognizer: Recognizer? = null
+            var totalPcm = 0L
             try {
-                voskSpeechService?.stop()
-                voskSpeechService?.shutdown()
-                val recognizer = Recognizer(model, 16000.0f)
-                val service = SpeechService(recognizer, 16000.0f)
-                voskSpeechService = service
-                service.startListening(object : VoskRecognitionListener {
-                    override fun onPartialResult(hypothesis: String) {
-                        val t = parseVoskJson(hypothesis, partial = true)
-                        if (t.isNotEmpty()) postPartialTranscript(t)
-                    }
+                val musicRoot = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir
+                val wavDir = File(musicRoot, "ADay/voice")
+                if (!wavDir.exists() && !wavDir.mkdirs()) {
+                    mainHandler.post { onError("Could not create voice recording folder") }
+                    return@Thread
+                }
+                val wavFile = File(wavDir, "voice_${System.currentTimeMillis()}.wav")
+                sessionWavFile = wavFile
+                raf = RandomAccessFile(wavFile, "rw")
+                writeWavHeaderPlaceholder(raf)
 
-                    override fun onResult(hypothesis: String) {
-                        val t = parseVoskJson(hypothesis, partial = false)
+                val minBuf = AudioRecord.getMinBufferSize(
+                    SAMPLE_RATE_HZ,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                )
+                if (minBuf <= 0) {
+                    mainHandler.post { onError("Microphone buffer size invalid") }
+                    return@Thread
+                }
+                val readChunkBytes = (SAMPLE_RATE_HZ * 2 * CAPTURE_READ_CHUNK_MS) / 1000
+                var bufferSizeBytes = maxOf(minBuf, readChunkBytes * 4)
+                if (bufferSizeBytes % 2 != 0) bufferSizeBytes++
+                audioRecord = openAudioRecordOrNull(bufferSizeBytes)
+                if (audioRecord == null || audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+                    audioRecord?.release()
+                    mainHandler.post { onError("Microphone not available") }
+                    return@Thread
+                }
+                captureAudioRecord = audioRecord
+                recognizer = Recognizer(model, SAMPLE_RATE_HZ.toFloat())
+                audioRecord.startRecording()
+                postListening(true)
+                notifySpeechModelReady()
+                Log.i(LOG_TAG, "offline_vosk_listening_started")
+                val buf = ByteArray(readChunkBytes)
+                val startedAtMs = System.currentTimeMillis()
+                while (!loadCancelled) {
+                    val now = System.currentTimeMillis()
+                    if (now - startedAtMs >= MAX_CAPTURE_MS) {
+                        break
+                    }
+                    val n = audioRecord.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING)
+                    if (n < 0) break
+                    if (n == 0) continue
+                    raf.write(buf, 0, n)
+                    totalPcm += n
+                    val chunk = if (n == buf.size) buf else buf.copyOf(n)
+                    if (recognizer.acceptWaveForm(chunk, n)) {
+                        val t = parseVoskJson(recognizer.result, partial = false)
                         if (t.isNotEmpty()) {
                             lastTranscript = t
                             Log.i(LOG_TAG, "vosk_result text=\"$lastTranscript\"")
                         }
-                    }
-
-                    override fun onFinalResult(hypothesis: String) {
-                        val t = parseVoskJson(hypothesis, partial = false)
-                        if (t.isNotEmpty()) {
-                            lastTranscript = t
-                            Log.i(LOG_TAG, "vosk_final text=\"$lastTranscript\"")
+                    } else {
+                        val p = parseVoskJson(recognizer.partialResult, partial = true)
+                        if (p.isNotEmpty()) {
+                            postPartialTranscript(p)
                         }
                     }
-
-                    override fun onError(exception: Exception) {
-                        Log.w(LOG_TAG, "vosk_recognition_error", exception)
-                    }
-
-                    override fun onTimeout() {
-                        Log.i(LOG_TAG, "vosk_timeout")
-                    }
-                })
-                postListening(true)
-                notifySpeechModelReady()
-                Log.i(LOG_TAG, "offline_vosk_listening_started")
+                }
+                val finalText = parseVoskJson(recognizer.finalResult, partial = false)
+                if (finalText.isNotEmpty()) {
+                    lastTranscript = finalText
+                    Log.i(LOG_TAG, "vosk_final text=\"$lastTranscript\"")
+                }
             } catch (e: Exception) {
-                Log.e(LOG_TAG, "vosk_start_failed", e)
-                mainHandler.post { onError("Offline speech failed: ${e.message}") }
+                if (!loadCancelled) {
+                    Log.e(LOG_TAG, "vosk_capture_failed", e)
+                    mainHandler.post { onError("Offline speech failed: ${e.message}") }
+                }
+            } finally {
+                try {
+                    audioRecord?.stop()
+                } catch (_: Exception) {
+                }
+                captureAudioRecord = null
+                audioRecord?.release()
+                try {
+                    if (raf != null) {
+                        patchWavHeader(raf, totalPcm)
+                        raf.close()
+                    }
+                } catch (_: Exception) {
+                }
+                recognizer?.close()
+                sessionWavFile?.let { wav ->
+                    try {
+                        val wavBytes = wav.readBytes()
+                        val exportedLocation = exportWavToPublicDownloads(context, wavBytes, wav.name)
+                        if (!exportedLocation.isNullOrBlank()) {
+                            mainHandler.post { onRecordingExported?.invoke(exportedLocation) }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(LOG_TAG, "vosk_export_failed", e)
+                    } finally {
+                        sessionWavFile = null
+                    }
+                }
             }
-        }
+        }.also { it.start() }
     }
 
     private fun parseVoskJson(json: String, partial: Boolean): String {
@@ -1295,10 +1414,9 @@ class LocalVoiceRecognizer(
      * - **API 29+**: [MediaStore] (Downloads first; some OEMs need [MediaStore.Audio] fallback).
      * - **API 28**: direct file write + [MediaScannerConnection] (needs [Manifest.permission.WRITE_EXTERNAL_STORAGE]).
      */
-    private fun exportWavToPublicDownloads(appContext: Context, wavFileBytes: ByteArray, fileName: String) {
+    private fun exportWavToPublicDownloads(appContext: Context, wavFileBytes: ByteArray, fileName: String): String? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            exportWavLegacyPublicDownload(appContext, wavFileBytes, fileName)
-            return
+            return exportWavLegacyPublicDownload(appContext, wavFileBytes, fileName)
         }
         val resolver = appContext.contentResolver
         val relative = "${Environment.DIRECTORY_DOWNLOADS}/ADay/voice"
@@ -1325,7 +1443,7 @@ class LocalVoiceRecognizer(
         }
         if (uri == null) {
             Log.w(LOG_TAG, "voice_wav_media_insert_failed collections=Downloads+Audio")
-            return
+            return null
         }
         try {
             resolver.openOutputStream(uri)?.use { out ->
@@ -1333,7 +1451,7 @@ class LocalVoiceRecognizer(
             } ?: run {
                 Log.w(LOG_TAG, "voice_wav_open_stream_failed")
                 resolver.delete(uri, null, null)
-                return
+                return null
             }
             val done = ContentValues().apply {
                 put(MediaStore.MediaColumns.IS_PENDING, 0)
@@ -1344,16 +1462,22 @@ class LocalVoiceRecognizer(
                 LOG_TAG,
                 "voice_recording_public_downloads uri=$uri collection=$used browse=$relative file=$fileName",
             )
+            return uri.toString()
         } catch (e: Exception) {
             Log.e(LOG_TAG, "voice_wav_media_write_failed", e)
             try {
                 resolver.delete(uri, null, null)
             } catch (_: Exception) {
             }
+            return null
         }
     }
 
-    private fun exportWavLegacyPublicDownload(appContext: Context, wavFileBytes: ByteArray, fileName: String) {
+    private fun exportWavLegacyPublicDownload(
+        appContext: Context,
+        wavFileBytes: ByteArray,
+        fileName: String,
+    ): String? {
         if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -1362,7 +1486,7 @@ class LocalVoiceRecognizer(
                 "voice_wav_api28_needs_WRITE_EXTERNAL_STORAGE — grant Storage for app in system settings, " +
                     "or upgrade device to Android 10+ for MediaStore export",
             )
-            return
+            return null
         }
         val dir = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
@@ -1370,7 +1494,7 @@ class LocalVoiceRecognizer(
         )
         if (!dir.exists() && !dir.mkdirs()) {
             Log.e(LOG_TAG, "voice_wav_legacy_mkdir_failed ${dir.absolutePath}")
-            return
+            return null
         }
         val file = File(dir, fileName)
         try {
@@ -1383,8 +1507,10 @@ class LocalVoiceRecognizer(
                 Log.i(LOG_TAG, "voice_recording_public_scanned path=$path uri=$scannedUri")
             }
             Log.i(LOG_TAG, "voice_recording_public_downloads path=${file.absolutePath}")
+            return file.absolutePath
         } catch (e: Exception) {
             Log.e(LOG_TAG, "voice_wav_legacy_write_failed", e)
+            return null
         }
     }
 
@@ -1397,6 +1523,8 @@ class LocalVoiceRecognizer(
         private const val MODEL_LOAD_JOIN_MS = 120_000L
         /** [stop] from [onStop] should not block long if model is still downloading. */
         private const val MODEL_LOAD_JOIN_SHORT_MS = 3_000L
+        /** Wait briefly after ERROR_CLIENT for a late final onResults callback. */
+        private const val ONLINE_CLIENT_ERROR_GRACE_MS = 900L
         /** Hard cap for command-mode capture (keeps latency predictable and files small). */
         private const val MAX_CAPTURE_MS = 8_000L
         /**
@@ -1445,13 +1573,32 @@ class LocalVoiceRecognizer(
         /** Online: system SR available. Offline: Vosk model loaded. */
         @JvmStatic
         fun isSpeechModelLoaded(context: Context): Boolean {
-            if (NetworkConnectivity.isLikelyOnline(context) &&
-                SpeechRecognizer.isRecognitionAvailable(context)
-            ) {
+            if (readShouldUseOnlineSpeechRoute(context)) {
                 return true
             }
             return cachedVoskModel != null
         }
+
+        private fun readOnlineSpeechPreferred(context: Context): Boolean =
+            try {
+                (context.applicationContext as HabitsApplication).component.preferences
+                    .voiceSpeechRecognitionMode == Preferences.VOICE_SPEECH_ONLINE
+            } catch (_: Throwable) {
+                false
+            }
+
+        private fun readShouldUseOnlineSpeechRoute(context: Context): Boolean =
+            readOnlineSpeechPreferred(context) &&
+                NetworkConnectivity.isLikelyOnline(context) &&
+                SpeechRecognizer.isRecognitionAvailable(context)
+
+        /**
+         * Same condition as the online branch in [ensureModelAndStart] — for status UI copy
+         * ("Listening online…" vs offline) while the mic is active.
+         */
+        @JvmStatic
+        fun shouldUseOnlineSpeechForStatusUi(context: Context): Boolean =
+            readShouldUseOnlineSpeechRoute(context)
 
         @JvmStatic
         fun isSpeechModelLoaded(): Boolean = cachedVoskModel != null || cachedWhisperContext != 0L

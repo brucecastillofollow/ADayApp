@@ -95,12 +95,21 @@
             android:title="@string/voice_llm_settings_category">
 
         <ListPreference
+            android:key="pref_voice_speech_recognition"
+            android:title="@string/pref_voice_speech_recognition_title"
+            android:summary="%s"
+            android:entries="@array/pref_voice_speech_recognition_entries"
+            android:entryValues="@array/pref_voice_speech_recognition_values"
+            android:defaultValue="offline"
+            app:iconSpaceReserved="false" />
+
+        <ListPreference
             android:key="pref_voice_post_recognition"
             android:title="@string/pref_voice_post_recognition_title"
             android:summary="%s"
             android:entries="@array/pref_voice_post_recognition_entries"
             android:entryValues="@array/pref_voice_post_recognition_values"
-            android:defaultValue="llm"
+            android:defaultValue="fuzzy_only"
             app:iconSpaceReserved="false" />
 
         <Preference

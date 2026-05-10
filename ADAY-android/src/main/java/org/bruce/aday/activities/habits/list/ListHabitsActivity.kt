@@ -173,6 +173,15 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                 }
             },
         )
+            .apply {
+                onRecordingExported = { location ->
+                    Toast.makeText(
+                        this@ListHabitsActivity,
+                        "Voice recording saved: $location",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
     }
 
     private lateinit var menu: ListHabitsMenu
@@ -265,6 +274,13 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
      * Toolbar actions usually show the icon only ([showAsAction] always), so we switch icon and
      * tint; title still updates for accessibility and overflow.
      */
+    private fun voiceListeningStatusPlaceholder(): String =
+        if (LocalVoiceRecognizer.shouldUseOnlineSpeechForStatusUi(this)) {
+            getString(R.string.voice_online_listening)
+        } else {
+            getString(R.string.voice_local_listening)
+        }
+
     private fun applyVoiceMenuState() {
         val item = rootView.tbar.menu.findItem(R.id.actionVoiceHabit) ?: return
         when {
@@ -281,7 +297,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
                 item.title = getString(R.string.voice_stop_recording)
                 item.setIcon(android.R.drawable.ic_media_pause)
                 MenuItemCompat.setIconTintList(item, android.content.res.ColorStateList.valueOf(Color.parseColor("#FF5252")))
-                rootView.setVoiceStatus(getString(R.string.voice_local_listening))
+                rootView.setVoiceStatus(voiceListeningStatusPlaceholder())
             }
             else -> {
                 item.title = getString(R.string.voice_habit_command)
@@ -296,7 +312,7 @@ class ListHabitsActivity : AppCompatActivity(), Preferences.Listener {
         if (!isVoiceRecording) return
         val text = partial.trim()
         rootView.setVoiceStatus(if (text.isBlank()) {
-            getString(R.string.voice_local_listening)
+            voiceListeningStatusPlaceholder()
         } else {
             text
         })

@@ -74,6 +74,17 @@
     <string name="voice_llm_progress_title">Offline AI model</string>
     <string name="voice_llm_download_preparing">Preparing download…</string>
     <string name="voice_llm_settings_category">Voice</string>
+    <string name="pref_voice_speech_recognition_title">Speech recognition</string>
+    <string name="pref_voice_speech_recognition_entry_offline">On-device (Vosk, offline)</string>
+    <string name="pref_voice_speech_recognition_entry_online">Android online (when available)</string>
+    <string-array name="pref_voice_speech_recognition_entries">
+        <item>@string/pref_voice_speech_recognition_entry_offline</item>
+        <item>@string/pref_voice_speech_recognition_entry_online</item>
+    </string-array>
+    <string-array name="pref_voice_speech_recognition_values">
+        <item>offline</item>
+        <item>online</item>
+    </string-array>
     <string name="pref_voice_post_recognition_title">Understand commands after speech</string>
     <string name="pref_voice_post_recognition_entry_llm">Offline AI when needed (TinyLlama)</string>
     <string name="pref_voice_post_recognition_entry_fuzzy">Fuzzy matching only (no AI model)</string>
@@ -87,7 +98,8 @@
         <item>llm</item>
         <item>fuzzy_only</item>
     </string-array>
-    <string name="voice_local_listening">Listening offline...</string>
+    <string name="voice_local_listening">Listening offline…</string>
+    <string name="voice_online_listening">Listening online…</string>
     <string name="voice_processing_command">Processing voice command…</string>
     <string name="voice_status_whisper_transcribing">Transcribing speech (Whisper)…</string>
     <string name="voice_status_llm_processing">Understanding command (AI)…</string>
